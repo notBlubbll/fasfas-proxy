@@ -14,6 +14,7 @@
       "models": {
         "qwen3.8-27b": {
           "name": "Qwen 3.8 27B",
+          "cost": { "input": 0.15, "output": 0.47, "cache_read": 0.016 },
           "capabilities": {
             "tools": true,
             "input": ["text", "image"],
@@ -36,6 +37,7 @@
         },
         "deepseek-v4.1-flash": {
           "name": "DeepSeek V4.1 Flash",
+          "cost": { "input": 0.15, "output": 0.6, "cache_read": 0.003 },
           "capabilities": {
             "tools": true,
             "input": ["text", "image"],
@@ -58,6 +60,7 @@
         },
         "glm-5.3-flash": {
           "name": "GLM 5.3 Flash",
+          "cost": { "input": 0.15, "output": 0.5, "cache_read": 0.03 },
           "capabilities": {
             "tools": true,
             "input": ["text", "image"],
@@ -80,6 +83,7 @@
         },
         "haiku-5.5": {
           "name": "Claude Haiku 5.5",
+          "cost": { "input": 0.1, "output": 0.5, "cache_read": 0.01 },
           "capabilities": {
             "tools": true,
             "input": ["text", "image"],
@@ -102,6 +106,7 @@
         },
         "sonnet-5.5": {
           "name": "Claude Sonnet 5.5",
+          "cost": { "input": 2, "output": 10, "cache_read": 0.1 },
           "capabilities": {
             "tools": true,
             "input": ["text", "image"],
