@@ -59,6 +59,45 @@ const TOKEN_LIMITS_DEFAULT =
   "qwen3.8-27b=3000000/60s,deepseek-v4.1-flash=2000000/60s,glm-5.3-flash=2000000/60s," +
   "haiku-5.5=2000000/60s,sonnet-5.5=1000000/60s";
 
+// USD per 1M tokens, from the OpenCode Go table (off-peak where a model has
+// peak/off-peak pricing) and the Console table for models Go does not list.
+// qwen3.8-27b is not published anywhere, so it uses the Qwen3.8 Flash rates.
+// Override with FASFAS_PROXY_PRICING="model=in/out/cached,...".
+const PRICING_DEFAULT = {
+  "deepseek-v4.1-flash": { in: 0.15, out: 0.60, cached: 0.003 },
+  "glm-5.3-flash": { in: 0.15, out: 0.50, cached: 0.03 },
+  "haiku-5.5": { in: 0.10, out: 0.50, cached: 0.01 },
+  "sonnet-5.5": { in: 2.00, out: 10.00, cached: 0.10 },
+  "qwen3.8-27b": { in: 0.15, out: 0.47, cached: 0.016 },
+};
+
+function parsePricing(src) {
+  const out = {};
+  for (const entry of String(src).split(",")) {
+    const e = entry.trim();
+    if (!e) continue;
+    const eq = e.indexOf("=");
+    if (eq < 0) continue;
+    const model = e.slice(0, eq).trim();
+    const parts = e.slice(eq + 1).split("/").map((n) => Number(n));
+    if (!model || parts.length < 2 || parts.some((n) => !Number.isFinite(n))) continue;
+    out[model] = { in: parts[0], out: parts[1], cached: parts[2] ?? parts[0] };
+  }
+  return out;
+}
+
+const PRICING = { ...PRICING_DEFAULT, ...parsePricing(process.env.FASFAS_PROXY_PRICING || "") };
+
+// Cost of one record. Cached tokens are part of the prompt count and are billed
+// at the cached-read rate instead of the full input rate.
+function recordCost(r) {
+  const p = PRICING[r.m];
+  if (!p) return 0;
+  const cached = Math.min(r.c || 0, r.i || 0);
+  const fresh = Math.max(0, (r.i || 0) - cached);
+  return (fresh * p.in + cached * p.cached + (r.o || 0) * p.out) / 1e6;
+}
+
 // Retries after an upstream 429 before the 429 is handed to the client.
 const MAX_429_RETRIES = 6;
 // Wall-clock ceiling for 429 waits on a single request.
@@ -169,7 +208,7 @@ function pruneUsage() {
 }
 
 function windowStats(model, since) {
-  const acc = { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, seeded: 0 };
+  const acc = { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, seeded: 0, cost: 0 };
   let realOutput = 0, realGenMs = 0, realMs = 0, realReq = 0;
   for (const r of usage.records) {
     if (r.t < since) continue;
@@ -179,6 +218,7 @@ function windowStats(model, since) {
     acc.output += r.o || 0;
     acc.reasoning += r.r || 0;
     acc.cached += r.c || 0;
+    acc.cost += recordCost(r);
     if (r.seed) {
       // Imported aggregate: real token counts, no timing to average.
       acc.seeded++;
@@ -189,6 +229,7 @@ function windowStats(model, since) {
     realGenMs += r.gm || 0;
     realMs += r.ms || 0;
   }
+  acc.cost = +acc.cost.toFixed(6);
   acc.avgTps = realGenMs > 0 ? +(realOutput / (realGenMs / 1000)).toFixed(1) : 0;
   acc.avgMs = realReq > 0 ? Math.round(realMs / realReq) : 0;
   return acc;
@@ -203,7 +244,7 @@ function usageReport() {
     "30d": now - 30 * 24 * 60 * 60 * 1000,
     all: 0,
   };
-  const out = { since: usage.since, updated: now, windows: {}, models: {} };
+  const out = { since: usage.since, updated: now, pricing: PRICING, windows: {}, models: {} };
   for (const [key, since] of Object.entries(windows)) {
     out.windows[key] = windowStats(null, since);
     out.models[key] = {};

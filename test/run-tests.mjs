@@ -116,6 +116,7 @@ const proxy = spawn(process.execPath, [path.join(ROOT, "index.js")], {
     FASFAS_PROXY_UPSTREAM: `http://127.0.0.1:${mockPort}/v1`,
     FASFAS_PROXY_LIMITS: "mock-ok=2/1000ms,mock-limited=100/1000ms,mock-textonly=0,mock-tokens=0,mock-a=1/500ms,mock-b=1/500ms",
     FASFAS_PROXY_TOKEN_LIMITS: "mock-tokens=1000/1000ms",
+    FASFAS_PROXY_PRICING: "mock-ok=1/2/0.5,mock-a=1/1/1,mock-b=1/1/1",
     FASFAS_PROXY_VISION_TARGETS: "mock-textonly",
     FASFAS_PROXY_VISION_MODEL: "mock-vision",
     FASFAS_PROXY_COMPACTION_MODEL: "mock-handoff",
@@ -350,6 +351,8 @@ log("\n/usage windows and per-model tokens");
   const m = j.models?.["24h"]?.["mock-ok"] || {};
   ok("counts input tokens", m.input > 0, JSON.stringify(m));
   ok("reports average tps", typeof m.avgTps === "number", JSON.stringify(m));
+  ok("prices the model", m.cost > 0, JSON.stringify({ cost: m.cost }));
+  ok("totals cost across models", j.windows["24h"].cost > 0, JSON.stringify(j.windows["24h"]));
   ok("lifetime totals kept", !!j.lifetime?.["mock-ok"], JSON.stringify(j.lifetime));
 }
 

@@ -1,19 +1,30 @@
 // desktop-usage-panel — OpenCode Desktop GUI part.
 //
-// Adds a "Fasfas usage" tab to the session side region: per-model requests,
-// input/output/reasoning/cached tokens, average output TPS and average latency,
-// switchable between 24h, 7d, 30d and all time. Data comes from the proxy's
-// GET /usage endpoint, polled every 5s.
+// Adds a "Fasfas usage" tab to the session side region: summary cards, a
+// per-model table with input/output/reasoning/cached tokens, average output
+// TPS, average latency and estimated cost, plus a titled totals row. Windows:
+// 24h / 7d / 30d / all. Data comes from the proxy's GET /usage endpoint.
 //
 // Loaded by the desktop from this prebuilt CommonJS bundle:
 //   Function("require","module","exports", code)(sharedRequire, module, module.exports)
 // `@opencode/plugin/gui` and `solid-js` are provided by the app at runtime.
 //
-// Written with plain DOM (no JSX, no build step): the panel renders a detached
-// element once and updates it in place, which needs no Solid reactivity.
+// Plain DOM, no JSX and no build step: the panel builds its nodes once and
+// updates them in place.
 const { Plugin, Panel, MenuItem, Command } = require("@opencode/plugin/gui");
 
 const WINDOWS = ["24h", "7d", "30d", "all"];
+const COLUMNS = [
+  { key: "model", label: "Model", align: "left" },
+  { key: "requests", label: "Req", align: "right" },
+  { key: "input", label: "In", align: "right" },
+  { key: "output", label: "Out", align: "right" },
+  { key: "reasoning", label: "Reason", align: "right" },
+  { key: "cached", label: "Cached", align: "right" },
+  { key: "avgTps", label: "tok/s", align: "right" },
+  { key: "avgMs", label: "avg", align: "right" },
+  { key: "cost", label: "$", align: "right" },
+];
 
 function fmt(n) {
   const v = Number(n) || 0;
@@ -23,23 +34,36 @@ function fmt(n) {
   return String(v);
 }
 
+function money(n) {
+  const v = Number(n) || 0;
+  if (v === 0) return "$0.00";
+  if (v < 0.01) return "$" + v.toFixed(4);
+  return "$" + v.toFixed(2);
+}
+
+const BORDER = "1px solid rgba(127,127,127,.18)";
+
 function buildPanel(endpoint, refreshMs) {
   const root = document.createElement("div");
   root.style.cssText = [
-    "padding:12px",
-    "font:12px/1.45 ui-sans-serif,system-ui,-apple-system,sans-serif",
+    "padding:14px",
+    "font:12px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif",
     "color:inherit",
     "height:100%",
     "overflow:auto",
     "box-sizing:border-box",
+    "display:flex",
+    "flex-direction:column",
+    "gap:12px",
   ].join(";");
 
+  // ---- header -------------------------------------------------------------
   const head = document.createElement("div");
-  head.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:10px;flex-wrap:wrap";
+  head.style.cssText = "display:flex;align-items:center;gap:6px;flex-wrap:wrap";
 
   const heading = document.createElement("div");
   heading.textContent = "Fasfas usage";
-  heading.style.cssText = "font-weight:600;font-size:13px;margin-right:auto;letter-spacing:.01em";
+  heading.style.cssText = "font-weight:650;font-size:13px;margin-right:auto;letter-spacing:.01em";
   head.appendChild(heading);
 
   let win = "24h";
@@ -49,14 +73,15 @@ function buildPanel(endpoint, refreshMs) {
     b.type = "button";
     b.textContent = w;
     b.style.cssText = [
-      "padding:2px 8px",
+      "padding:3px 9px",
       "border-radius:999px",
-      "border:1px solid rgba(127,127,127,.35)",
+      "border:1px solid rgba(127,127,127,.3)",
       "background:transparent",
       "color:inherit",
       "cursor:pointer",
       "font:inherit",
-      "line-height:1.6",
+      "line-height:1.5",
+      "transition:background .12s",
     ].join(";");
     b.onclick = () => { win = w; paint(); };
     buttons[w] = b;
@@ -69,43 +94,98 @@ function buildPanel(endpoint, refreshMs) {
   refreshBtn.title = "Refresh now";
   refreshBtn.setAttribute("aria-label", "Refresh now");
   refreshBtn.style.cssText = [
-    "padding:2px 8px",
+    "padding:3px 9px",
     "border-radius:999px",
-    "border:1px solid rgba(127,127,127,.35)",
+    "border:1px solid rgba(127,127,127,.3)",
     "background:transparent",
     "color:inherit",
     "cursor:pointer",
     "font:inherit",
-    "line-height:1.6",
+    "line-height:1.5",
   ].join(";");
   refreshBtn.onclick = () => { refresh(); };
   head.appendChild(refreshBtn);
   root.appendChild(head);
 
-  const summary = document.createElement("div");
-  summary.style.cssText = "margin-bottom:10px;opacity:.72;font-variant-numeric:tabular-nums";
-  root.appendChild(summary);
+  // ---- summary cards ------------------------------------------------------
+  const cards = document.createElement("div");
+  cards.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,minmax(92px,1fr));gap:8px";
+  root.appendChild(cards);
 
+  const cardValues = {};
+  for (const [key, label] of [["requests", "Requests"], ["input", "Input"], ["output", "Output"], ["cost", "Cost"]]) {
+    const card = document.createElement("div");
+    card.style.cssText = [
+      "padding:9px 11px",
+      "border-radius:9px",
+      "background:rgba(127,127,127,.08)",
+      "border:" + BORDER,
+      "min-width:0",
+    ].join(";");
+    const k = document.createElement("div");
+    k.textContent = label;
+    k.style.cssText = "font-size:10px;letter-spacing:.06em;text-transform:uppercase;opacity:.55";
+    const v = document.createElement("div");
+    v.textContent = "—";
+    v.style.cssText = "font-size:16px;font-weight:650;margin-top:3px;font-variant-numeric:tabular-nums;white-space:nowrap";
+    card.appendChild(k);
+    card.appendChild(v);
+    cards.appendChild(card);
+    cardValues[key] = v;
+  }
+
+  // ---- table --------------------------------------------------------------
   const table = document.createElement("table");
   table.style.cssText = "width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums";
   root.appendChild(table);
 
   const footer = document.createElement("div");
-  footer.style.cssText = "margin-top:10px;opacity:.5;font-size:11px";
+  footer.style.cssText = "margin-top:auto;padding-top:6px;opacity:.5;font-size:11px";
   root.appendChild(footer);
 
   let data = null;
   let error = null;
 
+  function th(text, align) {
+    const el = document.createElement("th");
+    el.textContent = text;
+    el.style.cssText = [
+      "text-align:" + align,
+      "padding:6px 8px",
+      "border-bottom:1px solid rgba(127,127,127,.28)",
+      "font-weight:600",
+      "font-size:11px",
+      "opacity:.6",
+      "white-space:nowrap",
+    ].join(";");
+    return el;
+  }
+
+  function td(text, align, opts = {}) {
+    const el = document.createElement("td");
+    el.textContent = text;
+    el.style.cssText = [
+      "text-align:" + align,
+      "padding:6px 8px",
+      "border-bottom:" + (opts.last ? "none" : BORDER),
+      "white-space:nowrap",
+      opts.strong ? "font-weight:650" : "",
+      opts.muted ? "opacity:.6" : "",
+      opts.model ? "max-width:130px;overflow:hidden;text-overflow:ellipsis" : "",
+    ].join(";");
+    if (opts.model) el.title = text;
+    return el;
+  }
+
   function paint() {
     for (const [k, b] of Object.entries(buttons)) {
       b.style.background = k === win ? "rgba(127,127,127,.22)" : "transparent";
-      b.style.fontWeight = k === win ? "600" : "400";
+      b.style.fontWeight = k === win ? "650" : "400";
     }
 
     table.textContent = "";
     if (error) {
-      summary.textContent = "";
+      for (const v of Object.values(cardValues)) v.textContent = "—";
       footer.textContent = "";
       const row = document.createElement("div");
       row.textContent = "proxy offline: " + error;
@@ -114,71 +194,62 @@ function buildPanel(endpoint, refreshMs) {
       return;
     }
     if (!data) {
-      summary.textContent = "loading…";
+      cardValues.requests.textContent = "…";
       return;
     }
 
     const w = data.windows && data.windows[win];
-    if (!w) {
-      summary.textContent = "no data yet for " + win;
-      return;
-    }
+    if (!w) { footer.textContent = "no data yet for " + win; return; }
 
-    summary.textContent =
-      `${w.requests} requests · ${fmt(w.input)} in · ${fmt(w.output)} out · ` +
-      `${fmt(w.cached)} cached · ${w.avgTps} tok/s avg`;
+    cardValues.requests.textContent = String(w.requests);
+    cardValues.input.textContent = fmt(w.input);
+    cardValues.output.textContent = fmt(w.output);
+    cardValues.cost.textContent = money(w.cost);
 
     const thead = document.createElement("thead");
     const hr = document.createElement("tr");
-    const cols = ["Model", "Req", "In", "Out", "Reason", "Cached", "tok/s", "avg"];
-    for (const c of cols) {
-      const th = document.createElement("th");
-      th.textContent = c;
-      th.style.cssText = [
-        "text-align:" + (c === "Model" ? "left" : "right"),
-        "padding:4px 6px",
-        "border-bottom:1px solid rgba(127,127,127,.28)",
-        "font-weight:600",
-        "opacity:.75",
-        "white-space:nowrap",
-      ].join(";");
-      hr.appendChild(th);
-    }
+    for (const c of COLUMNS) hr.appendChild(th(c.label, c.align));
     thead.appendChild(hr);
     table.appendChild(thead);
 
     const body = document.createElement("tbody");
     const models = (data.models && data.models[win]) || {};
-    const rows = Object.entries(models).sort((a, b) => (b[1].output || 0) - (a[1].output || 0));
+    const rows = Object.entries(models).sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0) || (b[1].output || 0) - (a[1].output || 0));
     for (const [name, m] of rows) {
       const tr = document.createElement("tr");
-      const values = [
-        name,
-        String(m.requests),
-        fmt(m.input),
-        fmt(m.output),
-        fmt(m.reasoning),
-        fmt(m.cached),
-        String(m.avgTps),
-        m.avgMs + "ms",
-      ];
-      values.forEach((v, i) => {
-        const td = document.createElement("td");
-        td.textContent = v;
-        td.style.cssText = [
-          "text-align:" + (i === 0 ? "left" : "right"),
-          "padding:4px 6px",
-          "border-bottom:1px solid rgba(127,127,127,.12)",
-          "white-space:nowrap",
-          i === 0 ? "max-width:150px;overflow:hidden;text-overflow:ellipsis" : "",
-        ].join(";");
-        tr.appendChild(td);
-      });
+      tr.appendChild(td(name, "left", { model: true }));
+      tr.appendChild(td(String(m.requests), "right"));
+      tr.appendChild(td(fmt(m.input), "right"));
+      tr.appendChild(td(fmt(m.output), "right"));
+      tr.appendChild(td(fmt(m.reasoning), "right"));
+      tr.appendChild(td(fmt(m.cached), "right"));
+      tr.appendChild(td(String(m.avgTps || 0), "right", { muted: !m.avgTps }));
+      tr.appendChild(td(m.avgMs ? m.avgMs + "ms" : "—", "right", { muted: !m.avgMs }));
+      tr.appendChild(td(money(m.cost), "right"));
       body.appendChild(tr);
     }
     table.appendChild(body);
 
-    footer.textContent = `auto ${Math.round(refreshMs / 1000)}s · updated ${new Date(data.updated || Date.now()).toLocaleTimeString()}`;
+    // totals
+    const tfoot = document.createElement("tfoot");
+    const tr = document.createElement("tr");
+    tr.style.background = "rgba(127,127,127,.06)";
+    const sumReq = rows.reduce((n, [, m]) => n + (m.requests || 0), 0);
+    tr.appendChild(td("Total", "left", { strong: true, last: true }));
+    tr.appendChild(td(String(sumReq), "right", { strong: true, last: true }));
+    tr.appendChild(td(fmt(w.input), "right", { strong: true, last: true }));
+    tr.appendChild(td(fmt(w.output), "right", { strong: true, last: true }));
+    tr.appendChild(td(fmt(w.reasoning), "right", { strong: true, last: true }));
+    tr.appendChild(td(fmt(w.cached), "right", { strong: true, last: true }));
+    tr.appendChild(td(String(w.avgTps || 0), "right", { strong: true, last: true }));
+    tr.appendChild(td(w.avgMs ? w.avgMs + "ms" : "—", "right", { strong: true, last: true }));
+    tr.appendChild(td(money(w.cost), "right", { strong: true, last: true }));
+    tfoot.appendChild(tr);
+    table.appendChild(tfoot);
+
+    footer.textContent =
+      `auto ${Math.round(refreshMs / 1000)}s · updated ${new Date(data.updated || Date.now()).toLocaleTimeString()}` +
+      (w.seeded ? ` · ${w.seeded} imported` : "");
   }
 
   const born = Date.now();
@@ -250,7 +321,7 @@ module.exports = {
         id: "usage",
         title: ctx.t("title"),
         icon: "status",
-        description: "tokens · tps",
+        description: "tokens · cost · tps",
         run: open,
       }));
 
