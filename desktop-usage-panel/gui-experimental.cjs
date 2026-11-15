@@ -43,7 +43,7 @@ function money(n) {
 
 const BORDER = "1px solid rgba(127,127,127,.18)";
 
-function buildPanel(endpoint, refreshMs) {
+function buildPanel(endpoint, refreshMs, headingText) {
   const root = document.createElement("div");
   root.style.cssText = [
     "padding:14px",
@@ -55,6 +55,11 @@ function buildPanel(endpoint, refreshMs) {
     "display:flex",
     "flex-direction:column",
     "gap:12px",
+    // The app disables selection on chrome-like surfaces; keep the numbers
+    // copyable with the mouse.
+    "user-select:text",
+    "-webkit-user-select:text",
+    "cursor:auto",
   ].join(";");
 
   // ---- header -------------------------------------------------------------
@@ -62,7 +67,7 @@ function buildPanel(endpoint, refreshMs) {
   head.style.cssText = "display:flex;align-items:center;gap:6px;flex-wrap:wrap";
 
   const heading = document.createElement("div");
-  heading.textContent = "Fasfas usage";
+  heading.textContent = headingText || "Usage";
   heading.style.cssText = "font-weight:650;font-size:13px;margin-right:auto;letter-spacing:.01em";
   head.appendChild(heading);
 
@@ -136,7 +141,7 @@ function buildPanel(endpoint, refreshMs) {
 
   // ---- table --------------------------------------------------------------
   const table = document.createElement("table");
-  table.style.cssText = "width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums";
+  table.style.cssText = "width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;user-select:text;-webkit-user-select:text";
   root.appendChild(table);
 
   const footer = document.createElement("div");
@@ -283,7 +288,7 @@ function buildPanel(endpoint, refreshMs) {
 
 module.exports = {
   default: Plugin.define({
-    i18n: { en: { title: "Fasfas usage" } },
+    i18n: { en: { title: "Fasfas usage", heading: "Usage" } },
     setup(ctx) {
       const endpoint = (ctx.options && ctx.options.usageEndpoint) || "http://127.0.0.1:17331/usage";
       const refreshMs = Math.max(1000, Number(ctx.options && ctx.options.refreshMs) || 5000);
@@ -313,7 +318,7 @@ module.exports = {
           cached: true,
         },
         list: (input) => (input.open.includes("usage") ? [tab] : []),
-        render: () => buildPanel(endpoint, refreshMs),
+        render: () => buildPanel(endpoint, refreshMs, ctx.t("heading")),
       });
 
       ctx.add(MenuItem, () => ({
