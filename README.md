@@ -183,13 +183,31 @@ The proxy log should show
 }
 ```
 
+## Verified against the live gateway
+
+`test/live-check.mjs` run against the real endpoint (real quota, real time):
+
+```
+healthz -> fasfas-proxy OK
+passthrough -> 200 871ms :: "OK"
+streaming -> 200 ct=text/event-stream events=5 done=true 577ms
+vision handoff -> 200 5846ms :: "Navy"      # haiku-5.5 answers 400 to this image directly
+caption cache -> 200 1871ms                  # same image, no second vision call
+pacing 8x sonnet (6/60s) -> [200,200,200,200,200,200,200,200] in 62.0s
+status.models["sonnet-5.5"] = { max: 6, used: 5, total: 8, throttled: 1, retries: 0 }
+```
+
+Eight requests against a 6-per-minute cap produced **zero 429s**: six went
+immediately, the rest waited out the window (one logged a 54.4s throttle).
+
 ## Tests
 
 ```
-node test/run-tests.mjs
+node test/run-tests.mjs          # offline, mock upstream, fast
+FASFAS_API_KEY=... node test/live-check.mjs   # real gateway, real quota
 ```
 
-Spins a mock upstream plus the proxy and asserts 24 cases: passthrough (status,
+`run-tests.mjs` spins a mock upstream plus the proxy and asserts 24 cases: passthrough (status,
 answer, authorization header, byte-exact model id, `/v1` path handling),
 streaming passthrough (content-type, every chunk, event count), local pacing
 past a 2-per-second window, `429` absorption (two `429`s then `200`, with the
