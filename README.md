@@ -141,6 +141,13 @@ is dropped or rejected.
   retries inside a 10-minute budget, after which the real `429` reaches the client.
 - **A prompt larger than the whole budget is still admitted.** It is clamped to
   the budget and queued behind existing traffic instead of waiting forever.
+- **Transient `5xx` is retried** (`502`, `503`, `504`, `520`, `522`, `524`) with
+  the same body and a 0.5/1/2/4/8s backoff, up to 5 attempts, then the real error
+  is forwarded. The log line carries the body size, so a deterministic
+  oversized-body failure is easy to tell apart from a genuine outage.
+- **Retries are visible.** `/status` reports `retries5xx` plus a per-session map
+  keyed by `x-opencode-session-id`, which the desktop plugin renders as a
+  composer pill (`Working (12s · retrying 2 · HTTP 502)`).
 
 ## Overflow spill
 
@@ -289,7 +296,8 @@ observations can describe; re-running replaces the previous seeds.
 - a `24h | 7d | 30d | all` switch, a **↻** refresh button and 5s auto-refresh;
 - a composer pill while the routed session is working:
   `Working (12s · retrying 2 · HTTP 502)`, the retry part appearing only when the
-  proxy is re-sending a request;
+  proxy is re-sending a request. This replaces a standalone working-timer plugin —
+  install one or the other, never both, or you get two pills;
 - opens from the side region's **+** menu or the command palette.
 
 It is an experimental GUI plugin (`gui-experimental.cjs`), prebuilt as CommonJS
