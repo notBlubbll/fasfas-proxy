@@ -32,7 +32,33 @@ const mock = createServer((req, res) => {
     const raw = Buffer.concat(chunks).toString("utf8");
     let body = {};
     try { body = JSON.parse(raw || "{}"); } catch {}
-    seen.push({ path: req.url, auth: req.headers.authorization, body, raw });
+    const startedAt = Date.now();
+    seen.push({ path: req.url, auth: req.headers.authorization, body, raw, startedAt });
+
+    if (req.url === "/v1/chat/completions" && body.model === "mock-slow") {
+      setTimeout(() => {
+        seen[seen.length - 1].endedAt = Date.now();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: "slow done" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+      }, 1200);
+      return;
+    }
+
+    if (req.url === "/v1/chat/completions" && body.model === "mock-compact") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n`);
+      res.write(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      return res.end();
+    }
+
+    if (req.url === "/v1/chat/completions" && body.model === "mock-handoff") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"SUMMARY FROM HANDOFF"}}]}\n\n`);
+      res.write(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      return res.end();
+    }
 
     if (req.url === "/v1/chat/completions" && body.model === "mock-limited") {
       limitedHits++;
@@ -88,9 +114,12 @@ const proxy = spawn(process.execPath, [path.join(ROOT, "index.js")], {
     ...process.env,
     FASFAS_PROXY_PORT: String(proxyPort),
     FASFAS_PROXY_UPSTREAM: `http://127.0.0.1:${mockPort}/v1`,
-    FASFAS_PROXY_LIMITS: "mock-ok=2/1000ms,mock-limited=100/1000ms,mock-textonly=0",
+    FASFAS_PROXY_LIMITS: "mock-ok=2/1000ms,mock-limited=100/1000ms,mock-textonly=0,mock-tokens=0,mock-a=1/500ms,mock-b=1/500ms",
+    FASFAS_PROXY_TOKEN_LIMITS: "mock-tokens=1000/1000ms",
     FASFAS_PROXY_VISION_TARGETS: "mock-textonly",
     FASFAS_PROXY_VISION_MODEL: "mock-vision",
+    FASFAS_PROXY_COMPACTION_MODEL: "mock-handoff",
+    FASFAS_PROXY_COMPACTION_MIN_BYTES: "50",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -202,6 +231,113 @@ log("\n/status");
   ok("reports vision config", j.vision.model === "mock-vision" && j.vision.targets.includes("mock-textonly"));
   ok("reports throttle counters", j.models["mock-ok"]?.throttled >= 1, JSON.stringify(j.models["mock-ok"]));
   ok("reports upstream retries", j.models["mock-limited"]?.retries >= 1, JSON.stringify(j.models["mock-limited"]));
+}
+
+log("\ncompaction: blocked finish hands off to the fallback model");
+{
+  const before = seen.length;
+  const bigPrompt = "Summarise the following session. ".repeat(20);
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "mock-compact", stream: true,
+      messages: [{ role: "user", content: bigPrompt }],
+    }),
+  });
+  const text = await r.text();
+  ok("client got 200", r.status === 200, `status ${r.status}`);
+  ok("client got the handoff summary", text.includes("SUMMARY FROM HANDOFF"), text.slice(0, 120));
+  const calls = seen.slice(before);
+  ok("original model was tried", calls.some((c) => c.body.model === "mock-compact"));
+  ok("fallback model was tried", calls.some((c) => c.body.model === "mock-handoff"));
+  const fallback = calls.find((c) => c.body.model === "mock-handoff");
+  ok("handoff body kept the messages", (fallback?.body?.messages?.[0]?.content || "").includes("Summarise the following"));
+
+  const st = await (await fetch(`${base}/status`)).json();
+  ok("status counts the handoff", st.compaction?.handoffs >= 1, JSON.stringify(st.compaction));
+}
+
+log("\ncompaction: waits for in-flight requests to settle");
+{
+  const before = seen.length;
+  const bigPrompt = "Summarise the following session. ".repeat(20);
+  const slow = fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock-slow", messages: [{ role: "user", content: "work" }] }),
+  });
+  await sleep(250);
+  const compact = fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock-compact", stream: true, messages: [{ role: "user", content: bigPrompt }] }),
+  });
+  await slow.then((r) => r.text());
+  await compact.then((r) => r.text());
+  const calls = seen.slice(before);
+  const slowCall = calls.find((c) => c.body.model === "mock-slow");
+  const compactCall = calls.find((c) => c.body.model === "mock-compact");
+  ok("compaction started after the slow request finished",
+    !!slowCall?.endedAt && !!compactCall && compactCall.startedAt >= slowCall.endedAt,
+    `slowEnd=${slowCall?.endedAt} compactStart=${compactCall?.startedAt}`);
+}
+
+log("\ncompaction: a request with tools is NOT treated as compaction");
+{
+  const before = seen.length;
+  const bigPrompt = "Summarise the following session. ".repeat(20);
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "mock-compact", stream: true,
+      tools: [{ type: "function", function: { name: "read", description: "read", parameters: { type: "object", properties: {} } } }],
+      messages: [{ role: "user", content: bigPrompt }],
+    }),
+  });
+  await r.text();
+  const calls = seen.slice(before);
+  ok("no handoff for a tool-carrying request", !calls.some((c) => c.body.model === "mock-handoff"), JSON.stringify(calls.map((c) => c.body.model)));
+}
+
+log("\ntoken budget (1000 tokens per 1000ms)");
+{
+  const big = "word ".repeat(1600); // ~8000 chars -> ~2000 estimated tokens
+  const body = JSON.stringify({ model: "mock-tokens", messages: [{ role: "user", content: big }] });
+  const t0 = Date.now();
+  const r1 = await fetch(`${base}/v1/chat/completions`, { method: "POST", headers: { authorization: "Bearer test-key", "content-type": "application/json" }, body });
+  await r1.text();
+  const t1 = Date.now();
+  const r2 = await fetch(`${base}/v1/chat/completions`, { method: "POST", headers: { authorization: "Bearer test-key", "content-type": "application/json" }, body });
+  const j2 = await r2.json();
+  const elapsed = Date.now() - t0;
+  ok("both answered", r1.status === 200 && r2.status === 200);
+  ok("second request waited on the token budget", t1 - t0 >= 0 && elapsed >= 700, `elapsed ${elapsed}ms`);
+  ok("answer still correct", j2.choices?.[0]?.message?.content === "echo:mock-tokens", JSON.stringify(j2.choices?.[0]?.message));
+
+  const st = await (await fetch(`${base}/status`)).json();
+  ok("status reports token limits", st.tokenLimits?.["mock-tokens"] === "1000/1s", JSON.stringify(st.tokenLimits));
+  ok("status reports token usage", st.models?.["mock-tokens"]?.tokenMax === 1000, JSON.stringify(st.models?.["mock-tokens"]));
+}
+
+log("\nlimits are per model, not shared");
+{
+  const t0 = Date.now();
+  const run = (m) => fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model: m, messages: [{ role: "user", content: "hi" }] }),
+  }).then((r) => r.text());
+  // mock-a and mock-b are each limited to 1/500ms. If the windows were shared,
+  // the second pair would serialize and take ~1500ms.
+  await Promise.all([run("mock-a"), run("mock-b"), run("mock-a"), run("mock-b")]);
+  const elapsed = Date.now() - t0;
+  ok("two models pace independently", elapsed < 1400, `elapsed ${elapsed}ms (serialized would be ~1500ms)`);
+  const st = await (await fetch(`${base}/status`)).json();
+  ok("each model has its own limiter", !!st.models["mock-a"] && !!st.models["mock-b"]);
+  ok("windows are separate objects", st.models["mock-a"].total >= 2 && st.models["mock-b"].total >= 2,
+    JSON.stringify({ a: st.models["mock-a"]?.total, b: st.models["mock-b"]?.total }));
 }
 
 proxy.kill();

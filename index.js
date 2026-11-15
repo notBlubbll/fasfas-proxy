@@ -43,11 +43,21 @@ const UPSTREAM = (() => {
 // `*` is the fallback for models without an explicit entry; 0 = unlimited.
 // A model with no entry and no `*` is unlimited.
 //
-// Defaults measured against the live gateway: sonnet-5.5 answers 429 after 6
-// requests in a minute, qwen3.8-27b / glm-5.3-flash / haiku-5.5 after 20, and
-// deepseek-v4.1-flash was still serving after 30 (left unlimited).
+// Defaults measured against the live gateway (dashboard + 429 probes):
+//   sonnet-5.5          6 req/min
+//   qwen3.8-27b        20 req/min
+//   glm-5.3-flash      20 req/min
+//   haiku-5.5          20 req/min
+//   deepseek-v4.1-flash 40 req/min, 2,000,000 tokens/min
 const LIMITS_DEFAULT =
-  "sonnet-5.5=6/60s,qwen3.8-27b=20/60s,glm-5.3-flash=20/60s,haiku-5.5=20/60s,deepseek-v4.1-flash=0";
+  "sonnet-5.5=6/60s,qwen3.8-27b=20/60s,glm-5.3-flash=20/60s,haiku-5.5=20/60s,deepseek-v4.1-flash=40/60s";
+
+// Token-per-minute budget per model, straight from the gateway dashboard.
+// Env format (FASFAS_PROXY_TOKEN_LIMITS): "haiku-5.5=2000000/60s".
+// Unlisted models have no token budget.
+const TOKEN_LIMITS_DEFAULT =
+  "qwen3.8-27b=3000000/60s,deepseek-v4.1-flash=2000000/60s,glm-5.3-flash=2000000/60s," +
+  "haiku-5.5=2000000/60s,sonnet-5.5=1000000/60s";
 
 // Retries after an upstream 429 before the 429 is handed to the client.
 const MAX_429_RETRIES = 6;
@@ -59,6 +69,9 @@ const RETRY_AFTER_CAP_MS = 120000;
 const QUEUE_LOG_MS = 5000;
 
 const LOG_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-proxy.log");
+const USAGE_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-usage.json");
+const USAGE_LOG = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-usage.jsonl");
+const USAGE_LOG_MAX_BYTES = 5 * 1024 * 1024;
 
 function log(msg) {
   const line = `${new Date().toISOString()} ${TAG} ${msg}`;
@@ -105,38 +118,87 @@ function parseLimits(src) {
 }
 
 const LIMITS = parseLimits(process.env.FASFAS_PROXY_LIMITS || LIMITS_DEFAULT);
+const TOKEN_LIMITS = parseLimits(process.env.FASFAS_PROXY_TOKEN_LIMITS || TOKEN_LIMITS_DEFAULT);
 const LIMIT_FALLBACK = LIMITS.get("*") || null;
+const TOKEN_FALLBACK = TOKEN_LIMITS.get("*") || null;
 
 class ModelLimiter {
-  constructor(model, max, windowMs) {
+  constructor(model, max, windowMs, tokenMax, tokenWindowMs) {
     this.model = model;
     this.max = max;
     this.windowMs = windowMs;
+    this.tokenMax = tokenMax;
+    this.tokenWindowMs = tokenWindowMs;
     this.stamps = [];              // dispatch times inside the window
+    this.tokens = [];              // { t, n } token reservations inside the window
     this.blockedUntil = 0;         // set by an upstream 429
     this.tail = Promise.resolve(); // FIFO reservation chain
     this.total = 0;
     this.throttled = 0;
     this.retries = 0;
+    this.shed = 0;                 // times a caller waited on the token budget
   }
 
   prune(now) {
     const cutoff = now - this.windowMs;
     while (this.stamps.length && this.stamps[0] <= cutoff) this.stamps.shift();
+    if (this.tokenMax > 0) {
+      const tc = now - this.tokenWindowMs;
+      while (this.tokens.length && this.tokens[0].t <= tc) this.tokens.shift();
+    }
+  }
+
+  tokenSum() {
+    let n = 0;
+    for (const e of this.tokens) n += e.n;
+    return n;
   }
 
   // milliseconds the caller must wait; 0 means a slot is free now
-  waitTime(now) {
+  waitTime(now, estTokens = 0) {
     this.prune(now);
     if (this.blockedUntil > now) return this.blockedUntil - now;
-    if (this.stamps.length < this.max) return 0;
-    return this.stamps[0] + this.windowMs - now;
+    if (this.max > 0 && this.stamps.length >= this.max) {
+      return this.stamps[0] + this.windowMs - now;
+    }
+    if (this.tokenMax > 0 && estTokens > 0) {
+      // A single request can exceed the whole budget (a huge compaction
+      // prompt). It must still be admitted, or it would wait forever: clamp
+      // the estimate to the budget and only queue behind existing traffic.
+      const est = Math.min(estTokens, this.tokenMax);
+      const used = this.tokenSum();
+      if (used + est > this.tokenMax) {
+        // wait until enough of the oldest reservations age out
+        let need = used + est - this.tokenMax;
+        let acc = 0;
+        for (const e of this.tokens) {
+          acc += e.n;
+          if (acc >= need) return e.t + this.tokenWindowMs - now;
+        }
+        return this.tokenWindowMs;
+      }
+    }
+    return 0;
   }
 
-  reserve(now) {
+  reserve(now, estTokens) {
     this.prune(now);
-    this.stamps.push(now);
-    this.total++;
+    if (this.max > 0) {
+      this.stamps.push(now);
+      this.total++;
+    }
+    let entry = null;
+    if (this.tokenMax > 0 && estTokens > 0) {
+      entry = { t: now, n: Math.min(estTokens, this.tokenMax) };
+      this.tokens.push(entry);
+    }
+    return entry;
+  }
+
+  // Replace a reservation's estimate with what the request actually used.
+  reconcile(entry, actualTokens) {
+    if (!entry || !Number.isFinite(actualTokens) || actualTokens <= 0) return;
+    entry.n = Math.max(1, Math.round(actualTokens));
   }
 
   blockFor(ms, now) {
@@ -149,10 +211,14 @@ class ModelLimiter {
       max: this.max,
       windowMs: this.windowMs,
       used: this.stamps.length,
+      tokenMax: this.tokenMax,
+      tokenWindowMs: this.tokenWindowMs,
+      tokensUsed: this.tokenSum(),
       blockedMs: Math.max(0, this.blockedUntil - now),
       total: this.total,
       throttled: this.throttled,
       retries: this.retries,
+      shed: this.shed,
     };
   }
 }
@@ -164,38 +230,48 @@ function limiterFor(model) {
   let lim = limiters.get(model);
   if (lim) return lim;
   const cfg = LIMITS.get(model) || LIMIT_FALLBACK;
-  if (!cfg || cfg.max <= 0) return null;
-  lim = new ModelLimiter(model, cfg.max, cfg.windowMs);
+  const tok = TOKEN_LIMITS.get(model) || TOKEN_FALLBACK;
+  const max = cfg ? cfg.max : 0;
+  const tokenMax = tok ? tok.max : 0;
+  if (max <= 0 && tokenMax <= 0) return null;
+  lim = new ModelLimiter(
+    model,
+    max,
+    cfg ? cfg.windowMs : 60000,
+    tokenMax,
+    tok ? tok.windowMs : 60000,
+  );
   limiters.set(model, lim);
   return lim;
 }
 
 // Strict FIFO: each caller awaits the previous reservation. Reservation is
 // instant, so this serializes slots rather than requests.
-function acquire(model) {
+function acquire(model, estTokens = 0) {
   const lim = limiterFor(model);
   if (!lim) return Promise.resolve(null);
   const run = lim.tail.then(async () => {
     const start = Date.now();
     for (;;) {
       const now = Date.now();
-      const wait = lim.waitTime(now);
+      const wait = lim.waitTime(now, estTokens);
       if (wait <= 0) {
-        lim.reserve(now);
+        const entry = lim.reserve(now, estTokens);
         const waited = now - start;
         if (waited > 0) {
           lim.throttled++;
           if (waited > QUEUE_LOG_MS) {
-            log(`throttled ${model} for ${(waited / 1000).toFixed(1)}s (limit ${lim.max}/${lim.windowMs / 1000}s)`);
+            log(`throttled ${model} for ${(waited / 1000).toFixed(1)}s (${lim.max}/${lim.windowMs / 1000}s` +
+              `${lim.tokenMax > 0 ? `, ${lim.tokenSum()}/${lim.tokenMax} tokens` : ""})`);
           }
         }
-        return;
+        return { limiter: lim, entry };
       }
       await sleep(Math.min(wait, 1000));
     }
   });
   lim.tail = run.catch(() => {});
-  return run.then(() => lim);
+  return run;
 }
 
 // ---- vision handoff --------------------------------------------------------
@@ -217,6 +293,28 @@ const VISION_TARGETS = (process.env.FASFAS_PROXY_VISION_TARGETS || VISION_TARGET
   .split(",").map((s) => s.trim()).filter(Boolean);
 const VISION_PROMPT = process.env.FASFAS_PROXY_VISION_PROMPT || VISION_PROMPT_DEFAULT;
 const visionCache = new Map();
+
+// ---- compaction handling ---------------------------------------------------
+// Compaction is the one request whose failure kills the whole turn: OpenCode
+// maps a content-filter finish to "Compaction summary was blocked by the
+// provider" and gives up. Compaction is a single big request that carries no
+// tools, so it is both easy to recognise and worth protecting:
+//   - it waits until no other request is in flight (no quota contention);
+//   - if the provider blocks it (content filter, error, unknown finish, 4xx),
+//     the same body is re-dispatched to a handoff model instead.
+const COMPACTION_ENABLED = !/^(0|false|off)$/i.test(process.env.FASFAS_PROXY_COMPACTION || "1");
+const COMPACTION_MODEL = process.env.FASFAS_PROXY_COMPACTION_MODEL || "glm-5.3-flash";
+const COMPACTION_MIN_CHARS = Number(process.env.FASFAS_PROXY_COMPACTION_MIN_BYTES) || 20000;
+// Finish reasons that mean "the provider refused", not "the answer ended".
+const BLOCKED_FINISH_RE = /^(content[-_]?filter|contentfilter|safety|blocked|refusal|sensitive)$/i;
+
+function looksLikeCompaction(meta) {
+  if (!COMPACTION_ENABLED || !meta.json) return false;
+  if (meta.model === COMPACTION_MODEL) return false;
+  const tools = meta.json.tools;
+  if (Array.isArray(tools) && tools.length > 0) return false; // normal tool turn
+  return meta.chars >= COMPACTION_MIN_CHARS;
+}
 
 function visionCacheGet(key) {
   const e = visionCache.get(key);
@@ -471,13 +569,16 @@ function learnFrom429(model, headers, text) {
   return { limiter: lim, retryMs };
 }
 
-function parseModel(body) {
-  try {
-    const j = JSON.parse(body.toString("utf8"));
-    return typeof j?.model === "string" ? j.model : null;
-  } catch {
-    return null;
-  }
+function readRequest(body) {
+  let json = null;
+  try { json = JSON.parse(body.toString("utf8")); } catch {}
+  return {
+    json,
+    model: typeof json?.model === "string" ? json.model : null,
+    stream: json?.stream === true,
+    maxTokens: json?.max_tokens ?? json?.max_completion_tokens ?? null,
+    chars: json ? JSON.stringify(json.messages || []).length : 0,
+  };
 }
 
 // ---- request handling ------------------------------------------------------
@@ -506,30 +607,57 @@ async function handle(req, res) {
         targets: VISION_TARGETS,
         cachedCaptions: visionCache.size,
       },
+      compaction: {
+        enabled: COMPACTION_ENABLED,
+        handoffModel: COMPACTION_MODEL,
+        minPromptChars: COMPACTION_MIN_CHARS,
+        handoffs: PROXY_STATE.compactionHandoffs || 0,
+      },
       limits: Object.fromEntries(
         [...LIMITS].filter(([k]) => k !== "*").map(([k, v]) => [k, `${v.max}/${v.windowMs / 1000}s`])),
+      tokenLimits: Object.fromEntries(
+        [...TOKEN_LIMITS].filter(([k]) => k !== "*").map(([k, v]) => [k, `${v.max}/${v.windowMs / 1000}s`])),
       models,
       updated: now,
     }, null, 2) + "\n", { "cache-control": "no-store", "access-control-allow-origin": "*" });
   }
 
   let body = await readBody(req);
-  let model = parseModel(body);
+  let meta = readRequest(body);
+  let model = meta.model;
   const isChat = url.pathname.includes("/chat/completions");
+  const started = Date.now();
+
+  log(`req ${req.method} ${url.pathname} model=${model || "-"} stream=${meta.stream} bytes=${body.length} max_tokens=${meta.maxTokens ?? "default"}`);
 
   PROXY_STATE.requests++;
   PROXY_STATE.active++;
   try {
     if (isChat && model) {
       body = await visionHandoff(body, model, req.headers.authorization);
-      model = parseModel(body) || model;
+      const after = readRequest(body);
+      if (after.model) meta = after;
+      model = after.model || model;
     }
 
+    // Compaction: no tools + a large prompt. Wait for other requests to settle
+    // so it does not compete for the per-minute window, then run it with a
+    // fallback model if the provider blocks the summary.
+    if (isChat && model && looksLikeCompaction(meta)) {
+      await deferWhileBusy(model);
+      const finished = await runCompaction(req, res, url, body, model);
+      if (finished) return;
+      meta = readRequest(body);
+      model = meta.model || model;
+    }
+
+    const estTokens = estimateTokens(body);
+    let reservation = null;
     if (isChat && model && limiterFor(model)) {
-      const started = Date.now();
+      const queuedAt = Date.now();
       PROXY_STATE.queued++;
-      try { await acquire(model); } finally { PROXY_STATE.queued--; }
-      const waited = Date.now() - started;
+      try { reservation = await acquire(model, estTokens); } finally { PROXY_STATE.queued--; }
+      const waited = Date.now() - queuedAt;
       if (waited > QUEUE_LOG_MS) log(`slot for ${model} after ${(waited / 1000).toFixed(1)}s`);
     }
 
@@ -537,7 +665,10 @@ async function handle(req, res) {
     const budgetStart = Date.now();
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const result = await forward(req, res, url, body, model, isChat);
-      if (result.done) return;
+      if (result.done) {
+        reconcileTokens(reservation, estTokens, result.bytes);
+        return;
+      }
       if (Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
         log(`429 budget exhausted for ${model}, forwarding the 429`);
         return sendJson(res, result.status, result.text);
@@ -549,6 +680,7 @@ async function handle(req, res) {
     }
   } finally {
     PROXY_STATE.active--;
+    log(`done ${url.pathname} model=${model || "-"} in ${Date.now() - started}ms`);
   }
 }
 
@@ -559,6 +691,7 @@ function forward(req, res, url, body, model, isChat) {
     const headers = buildForwardHeaders(req.headers, body.length);
 
     let settled = false;
+    let respBytes = 0;
     const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
 
     let up;
@@ -579,33 +712,222 @@ function forward(req, res, url, body, model, isChat) {
 
     up.on("response", (upRes) => {
       const status = upRes.statusCode || 502;
+      upRes.on("data", (c) => { respBytes += c.length; });
       const hdrs = { ...upRes.headers };
       delete hdrs["transfer-encoding"];
       delete hdrs["content-length"];
       delete hdrs.connection;
 
-      if (status === 429 && isChat && model) {
-        const chunks = [];
-        let size = 0;
-        upRes.on("data", (c) => { if (size < 65536) { chunks.push(c); size += c.length; } });
-        upRes.on("end", () => finish({ retry: true, status, headers: upRes.headers, text: Buffer.concat(chunks).toString("utf8") }));
-        upRes.on("error", () => finish({ retry: true, status, headers: upRes.headers, text: "" }));
-        return;
+      if (status !== 200) {
+        // Always leave a trace of a non-2xx: this is what makes a failed turn
+        // attributable instead of an opaque "blocked by the provider".
+        const ct = String(hdrs["content-type"] || "");
+        if (!ct.includes("event-stream")) {
+          const chunks = [];
+          let size = 0;
+          upRes.on("data", (c) => { if (size < 65536) { chunks.push(c); size += c.length; } });
+          upRes.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8");
+            log(`res ${status} model=${model || "-"} :: ${text.replace(/\s+/g, " ").slice(0, 400)}`);
+            if (status === 429 && isChat && model) return finish({ retry: true, status, headers: upRes.headers, text });
+            res.writeHead(status, hdrs);
+            res.end(text);
+            finish({ done: true });
+          });
+          upRes.on("error", () => {
+            if (status === 429 && isChat && model) return finish({ retry: true, status, headers: upRes.headers, text: "" });
+            try { res.end(); } catch {}
+            finish({ done: true });
+          });
+          return;
+        }
       }
 
+      log(`res ${status} model=${model || "-"} ct=${hdrs["content-type"] || "-"}`);
       res.writeHead(status, hdrs);
       upRes.pipe(res);
-      upRes.on("end", () => finish({ done: true }));
-      upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true }); });
+      upRes.on("end", () => finish({ done: true, bytes: respBytes }));
+      upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, bytes: respBytes }); });
     });
 
-    res.on("close", () => { if (!res.writableEnded) { try { up.destroy(); } catch {} } });
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        log(`client closed mid-stream model=${model || "-"} (upstream ${up.res?.statusCode || "pending"})`);
+        try { up.destroy(); } catch {}
+      }
+    });
     up.end(body);
   });
 }
 
-function send(res, status, type, text, extra = {}) {
+// ---- compaction path -------------------------------------------------------
+
+function reconcileTokens(reservation, estTokens, respBytes) {
+  if (!reservation) return;
+  const actual = estTokens + Math.ceil((respBytes || 0) / 4);
+  reservation.limiter.reconcile(reservation.entry, actual);
+}
+
+// Rough prompt size, with inline data URLs collapsed so a screenshot is not
+// counted as hundreds of thousands of text tokens before it reaches upstream.
+function estimateTokens(body) {
+  let text = body.toString("utf8");
+  if (text.includes("data:")) text = text.replace(/data:[^"\\]+/g, "data:image");
+  return Math.ceil(text.length / 4);
+}
+
+// Wait until no other request is in flight. The compaction request is the one
+// whose failure costs a whole turn, so it gets a quiet window instead of racing
+// long turns for the same per-minute budget.
+async function deferWhileBusy(model) {
+  const t0 = Date.now();
+  while (PROXY_STATE.active > 1) {
+    await sleep(250);
+    if (Date.now() - t0 > 120000) break; // never park a turn forever
+  }
+  const waited = Date.now() - t0;
+  if (waited > 500) log(`deferred compaction ${model} ${(waited / 1000).toFixed(1)}s until in-flight requests settled`);
+}
+
+function rewriteModel(body, model) {
   try {
+    const json = JSON.parse(body.toString("utf8"));
+    json.model = model;
+    return Buffer.from(JSON.stringify(json), "utf8");
+  } catch {
+    return body;
+  }
+}
+
+// One upstream attempt, fully buffered. Used only for compaction: the response
+// is small enough to hold, and we must see the finish reason before deciding to
+// forward it or hand off to the fallback model.
+function forwardBuffered(req, url, body, model) {
+  return new Promise((resolve) => {
+    const headers = buildForwardHeaders(req.headers, body.length);
+    let up;
+    try {
+      up = upstreamRequest(targetUrl(url.pathname + url.search), { method: req.method, headers });
+    } catch (err) {
+      return resolve({ status: 502, headers: {}, text: `fasfas-proxy: ${err?.message || err}`, finish: null });
+    }
+    up.on("error", (err) => resolve({ status: 502, headers: {}, text: `fasfas-proxy upstream error: ${err?.message || err}`, finish: null }));
+    up.on("response", (upRes) => {
+      const chunks = [];
+      let size = 0;
+      upRes.on("data", (c) => { chunks.push(c); size += c.length; });
+      upRes.on("end", () => {
+        const text = Buffer.concat(chunks, size).toString("utf8");
+        const hdrs = { ...upRes.headers };
+        resolve({
+          status: upRes.statusCode || 502,
+          headers: hdrs,
+          text,
+          finish: extractFinish(upRes.headers["content-type"], text),
+        });
+      });
+      upRes.on("error", (err) => resolve({ status: 502, headers: {}, text: `fasfas-proxy stream error: ${err?.message || err}`, finish: null }));
+    });
+    up.end(body);
+  });
+}
+
+function extractFinish(contentType, text) {
+  if (String(contentType || "").includes("event-stream")) {
+    let last = null;
+    for (const line of text.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const m = /"finish_reason"\s*:\s*"([^"]+)"/.exec(t);
+      if (m) last = m[1];
+    }
+    return last;
+  }
+  try {
+    const j = JSON.parse(text);
+    const r = j?.choices?.[0]?.finish_reason;
+    if (typeof r === "string") return r;
+    if (j?.error) return "error";
+  } catch {}
+  return null;
+}
+
+function isBlockedCompaction(r) {
+  if (r.finish && BLOCKED_FINISH_RE.test(r.finish)) return true;
+  if (r.finish === "error") return true;
+  if (r.status >= 400) return true; // 429 is handled before this point
+  return false;
+}
+
+function writeBuffered(res, r) {
+  const hdrs = { ...r.headers };
+  delete hdrs["transfer-encoding"];
+  delete hdrs["content-length"];
+  delete hdrs.connection;
+  try {
+    res.writeHead(r.status, hdrs);
+    res.end(r.text);
+  } catch {}
+}
+
+// Runs one compaction request: quiet window, then the original model, then the
+// handoff model if the provider blocked it. Returns true when the client has
+// been answered.
+async function runCompaction(req, res, url, body, model) {
+  const estTokens = estimateTokens(body);
+  let reservation = null;
+  if (limiterFor(model)) {
+    PROXY_STATE.queued++;
+    try { reservation = await acquire(model, estTokens); } finally { PROXY_STATE.queued--; }
+  }
+  const settle = (r) => reconcileTokens(reservation, estTokens, usageTokens(r.text) || r.text.length);
+
+  const budgetStart = Date.now();
+  for (let attempt = 1; attempt <= MAX_429_RETRIES + 1; attempt++) {
+    const r = await forwardBuffered(req, url, body, model);
+
+    if (r.status === 429) {
+      const { retryMs } = learnFrom429(model, r.headers, r.text);
+      PROXY_STATE.retries++;
+      log(`upstream 429 for ${model} (compaction); waiting ${Math.round(retryMs / 1000)}s (attempt ${attempt})`);
+      if (Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
+        writeBuffered(res, r);
+        return true;
+      }
+      await sleep(retryMs);
+      continue;
+    }
+
+    if (!isBlockedCompaction(r)) {
+      log(`compaction ok model=${model} status=${r.status} finish=${r.finish || "-"} bytes=${r.text.length}`);
+      settle(r);
+      writeBuffered(res, r);
+      return true;
+    }
+
+    log(`compaction blocked model=${model} status=${r.status} finish=${r.finish || "-"}; handing off to ${COMPACTION_MODEL}`);
+    settle(r);
+    PROXY_STATE.compactionHandoffs = (PROXY_STATE.compactionHandoffs || 0) + 1;
+    const handoffBody = rewriteModel(body, COMPACTION_MODEL);
+    let handoffReservation = null;
+    if (limiterFor(COMPACTION_MODEL)) handoffReservation = await acquire(COMPACTION_MODEL, estimateTokens(handoffBody));
+    const r2 = await forwardBuffered(req, url, handoffBody, COMPACTION_MODEL);
+    reconcileTokens(handoffReservation, estimateTokens(handoffBody), usageTokens(r2.text) || r2.text.length);
+    log(`compaction handoff model=${COMPACTION_MODEL} status=${r2.status} finish=${r2.finish || "-"} bytes=${r2.text.length}`);
+    writeBuffered(res, r2);
+    return true;
+  }
+  return false;
+}
+
+function usageTokens(text) {
+  const re = /"total_tokens"\s*:\s*(\d+)/g;
+  let last = null, m;
+  while ((m = re.exec(text))) last = Number(m[1]);
+  return last;
+}
+
+function send(res, status, type, text, extra = {}) {  try {
     res.writeHead(status, { "content-type": type, ...extra });
     res.end(text);
   } catch {}
@@ -654,17 +976,18 @@ async function startServer(port, mode) {
   };
   server.__fasfasShutdown = shutdown;
 
-  // hot-reload safety: a previous instance must release the port first
-  try {
-    const prev = globalThis.__fasfasProxyServer;
-    globalThis.__fasfasProxyServer = null;
-    if (prev) {
-      try { prev.__fasfasShutdown?.(); } catch {}
-      try { prev.closeAllConnections?.(); } catch {}
-      await new Promise((resolve) => { try { prev.close(resolve); } catch { resolve(); } });
-    }
-  } catch {}
+  // OpenCode loads a plugin once per open location, and again on every config
+  // reload. Killing the previous instance here would drop streams that are in
+  // flight (a compaction or a long turn dies as a provider error), so the first
+  // live instance keeps serving and later setup() calls become no-ops.
+  // Consequence: updating plugin code needs a service restart, not a reload.
+  const existing = globalThis.__fasfasProxyServer;
+  if (existing && existing.listening && existing.__fasfasPort === port) {
+    log(`reusing the running instance on port ${port} (a reload does not restart it)`);
+    return;
+  }
   globalThis.__fasfasProxyServer = server;
+  server.__fasfasPort = port;
 
   const listen = () => {
     if (shuttingDown) return;
@@ -675,6 +998,7 @@ async function startServer(port, mode) {
       log(`listening (${mode}) on http://${LISTEN_HOST}:${port} -> ${UPSTREAM.href}`);
       log(`limits: ${lim || "none"}${LIMIT_FALLBACK ? ` (fallback ${LIMIT_FALLBACK.max}/${LIMIT_FALLBACK.windowMs / 1000}s)` : ""}`);
       log(`vision: ${VISION_ENABLED ? `on model=${VISION_MODEL} targets=${VISION_TARGETS.join(",")}` : "off"}`);
+      log(`compaction: ${COMPACTION_ENABLED ? `on handoff=${COMPACTION_MODEL} minPrompt=${COMPACTION_MIN_CHARS} chars` : "off"}`);
     });
   };
   server.on("error", (err) => {

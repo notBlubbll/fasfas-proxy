@@ -10,6 +10,9 @@ OpenAI-compatible gateway and does two jobs:
 2. **Vision handoff.** Models that cannot accept images get their image parts
    captioned by a vision model and replaced with the caption text, so a
    text-only model answers normally. One request in, one stream out.
+3. **Compaction protection.** Compaction is the one request whose failure costs
+   the whole turn, so it waits for a quiet window and, if the provider blocks
+   the summary, is re-dispatched to a handoff model.
 
 Everything else is a transparent passthrough: the inbound `authorization`
 header is forwarded unchanged, the request body (including the model id) is
@@ -19,20 +22,31 @@ No credentials are stored in this repository.
 
 ## Measured limits
 
-Probed against the live gateway, one request per call, no pacing:
+Read from the gateway dashboard and confirmed by burst probes:
 
-| Model | Requests before `429` | Limit |
+| Model | Requests/min | Tokens/min |
 | --- | --- | --- |
-| `sonnet-5.5` | 6 | **6 / minute** |
-| `qwen3.8-27b` | 20 | **20 / minute** |
-| `glm-5.3-flash` | 20 | **20 / minute** |
-| `haiku-5.5` | 20 | **20 / minute** |
-| `deepseek-v4.1-flash` | 30+ (never failed) | no cap observed |
+| `qwen3.8-27b` | 20 | 3,000,000 |
+| `deepseek-v4.1-flash` | 40 | 2,000,000 |
+| `glm-5.3-flash` | 20 | 2,000,000 |
+| `haiku-5.5` | 20 | 2,000,000 |
+| `sonnet-5.5` | 6 | 1,000,000 |
+| **aggregate** | **106** | **10,000,000** |
 
-Notes from the same probe:
+**The limits are per model, not shared.** Each model has its own independent
+window, so saturating one does not consume another's budget — the proxy gives
+every model its own limiter and its own FIFO queue. Verified: saturating
+`sonnet-5.5` to a hard 429 left `deepseek-v4.1-flash` answering `200`, and 30
+parallel `qwen3.8-27b` calls yielded exactly 20 × 200 + 10 × 429 regardless of
+other traffic.
 
-- Limits are **per model**, not per key: saturating one model does not throttle
-  another.
+Notes from the probes:
+
+- Limits are **per model**, not per key or shared: the aggregate ceiling is
+  106 requests/min and 10M tokens/min, reached only by using every model at
+  once.
+- No token-per-minute limit was ever hit with a single 150k-token prompt, but
+  the dashboard shows the budgets above and the proxy now paces on them.
 - The `429` body names the limit and the wait:
   `"... request limit reached (6 requests per minute). Try again in 49s."`
 - `retry-after` was accurate to the second in every sample (waited 50s → `200`).
@@ -107,20 +121,26 @@ node index.js     # or: bun index.js
 | --- | --- | --- |
 | `FASFAS_PROXY_PORT` | `17331` | listen port (`127.0.0.1` only) |
 | `FASFAS_PROXY_UPSTREAM` | `https://ai.coffeevps.com/v1` | upstream base URL |
-| `FASFAS_PROXY_LIMITS` | measured table above | `model=max/window` list, e.g. `sonnet-5.5=6/60s,*=0` |
+| `FASFAS_PROXY_LIMITS` | measured table above | requests per window: `model=max/window`, e.g. `sonnet-5.5=6/60s,*=0` |
+| `FASFAS_PROXY_TOKEN_LIMITS` | measured table above | tokens per window: `model=tokens/window`, e.g. `haiku-5.5=2000000/60s` |
 | `FASFAS_PROXY_RL_BUDGET_MS` | `600000` | max wall-clock spent absorbing `429`s for one request |
 | `FASFAS_PROXY_VISION` | on | `0` disables the vision handoff |
 | `FASFAS_PROXY_VISION_TARGETS` | `haiku-5.5,sonnet-5.5` | comma list of text-only models (`*` and `prefix*` supported) |
 | `FASFAS_PROXY_VISION_MODEL` | `glm-5.3-flash` | model used to caption images |
 | `FASFAS_PROXY_VISION_PROMPT` | built-in | caption prompt override |
+| `FASFAS_PROXY_COMPACTION` | on | `0` disables compaction protection |
+| `FASFAS_PROXY_COMPACTION_MODEL` | `glm-5.3-flash` | handoff model used when a summary is blocked |
+| `FASFAS_PROXY_COMPACTION_MIN_BYTES` | `20000` | prompt size (chars) above which a tool-less request counts as compaction |
 
 `FASFAS_PROXY_LIMITS` uses `model=count/window` with `ms`, `s`, `m` or `h`
 windows. `0` means unlimited. `*` is the fallback for unlisted models.
 
 ### Retry behaviour
 
-- **Local pacing (default path):** a request that would exceed the window waits
-  for the next free slot, then goes upstream. Nothing is dropped.
+- **Local pacing (default path):** a request that would exceed the model's
+  request window *or* its token budget waits for the next free slot, then goes
+  upstream. Nothing is dropped. Token reservations use a `chars / 4` estimate
+  and are reconciled against the real response size when the turn completes.
 - **Upstream `429` (limit changed, shared key, race):** `retry-after` is honoured
   (capped at 120s), the limit in the message is learned and applied to the local
   limiter, and the request is re-dispatched. Up to 6 retries and a 10-minute
@@ -162,6 +182,35 @@ opencode run -m fasfas/haiku-5.5 --file=shot.png "what text is in the image?"
 The proxy log should show
 `vision handoff model=haiku-5.5 images=1 analyzed=1`.
 
+## Compaction protection
+
+Compaction sends the whole session as one large, tool-less request. If the
+provider ends that stream with a `content-filter` finish reason, OpenCode aborts
+the turn with *"Compaction summary was blocked by the provider"* — which is a
+model/upstream safety decision, not a quota or timing problem.
+
+A request is treated as compaction when it carries **no tools** and its messages
+exceed `FASFAS_PROXY_COMPACTION_MIN_BYTES` characters. Such a request:
+
+1. **waits for a quiet window** — it will not start while another request is in
+   flight, so it never competes for the per-minute budget (max 120s wait);
+2. **is buffered**, because the finish reason only arrives at the end and the
+   decision depends on it;
+3. **fails over** to `FASFAS_PROXY_COMPACTION_MODEL` (`glm-5.3-flash`) when the
+   provider blocks it — a content-filter finish, an error finish, or any 4xx.
+   A different upstream applies a different classifier, so the same body usually
+   summarizes fine.
+
+Both attempts are logged:
+
+```
+compaction blocked model=haiku-5.5 status=200 finish=content_filter; handing off to glm-5.3-flash
+compaction handoff model=glm-5.3-flash status=200 finish=stop bytes=4821
+```
+
+Normal tool-carrying requests are never buffered or rerouted, so streaming
+latency is unchanged outside compaction.
+
 ## Endpoints
 
 - `GET /healthz` → `fasfas-proxy OK`
@@ -176,9 +225,15 @@ The proxy log should show
   "requests": 42,
   "retries429": 2,
   "vision": { "enabled": true, "model": "glm-5.3-flash", "targets": ["haiku-5.5", "sonnet-5.5"], "cachedCaptions": 1 },
+  "compaction": { "enabled": true, "handoffModel": "glm-5.3-flash", "minPromptChars": 20000, "handoffs": 0 },
   "limits": { "sonnet-5.5": "6/60s", "haiku-5.5": "20/60s" },
+  "tokenLimits": { "sonnet-5.5": "1000000/60s", "haiku-5.5": "2000000/60s" },
   "models": {
-    "sonnet-5.5": { "max": 6, "windowMs": 60000, "used": 4, "blockedMs": 0, "total": 42, "throttled": 3, "retries": 0 }
+    "sonnet-5.5": {
+      "max": 6, "windowMs": 60000, "used": 4,
+      "tokenMax": 1000000, "tokenWindowMs": 60000, "tokensUsed": 174217,
+      "blockedMs": 0, "total": 42, "throttled": 3, "retries": 0, "shed": 0
+    }
   }
 }
 ```
@@ -207,13 +262,20 @@ node test/run-tests.mjs          # offline, mock upstream, fast
 FASFAS_API_KEY=... node test/live-check.mjs   # real gateway, real quota
 ```
 
-`run-tests.mjs` spins a mock upstream plus the proxy and asserts 24 cases: passthrough (status,
+`run-tests.mjs` spins a mock upstream plus the proxy and asserts 40 cases: passthrough (status,
 answer, authorization header, byte-exact model id, `/v1` path handling),
 streaming passthrough (content-type, every chunk, event count), local pacing
 past a 2-per-second window, `429` absorption (two `429`s then `200`, with the
 upstream retried three times), vision handoff (image removed, caption inserted,
 vision model called once, caption cache preventing a second call), and the
 `/status` payload (limits, vision config, throttle and retry counters).
+
+The compaction, token-budget and isolation cases were added with the newer
+revisions: a blocked finish hands off to the fallback model (and the handoff body
+keeps the messages), compaction waits for in-flight requests to settle, a
+tool-carrying request is never treated as compaction, the token budget defers a
+second oversized request, and two limited models pace independently instead of
+sharing a window.
 
 ## Operational notes
 
