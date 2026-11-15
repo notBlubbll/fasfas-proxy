@@ -435,14 +435,26 @@ function limiterFor(model) {
 
 // Strict FIFO: each caller awaits the previous reservation. Reservation is
 // instant, so this serializes slots rather than requests.
-function acquire(model, estTokens = 0) {
+//
+// With `maxWaitMs`, a caller gives up its place instead of waiting longer than
+// that and resolves `{ spill: true }` without reserving anything, so the caller
+// can send the request somewhere else (see the overflow rules below).
+function acquire(model, estTokens = 0, maxWaitMs = 0) {
   const lim = limiterFor(model);
   if (!lim) return Promise.resolve(null);
+  const calledAt = Date.now();
+  let cancelled = false;
   const run = lim.tail.then(async () => {
+    if (cancelled) return { spill: true };
     const start = Date.now();
     for (;;) {
+      if (cancelled) return { spill: true };
       const now = Date.now();
       const wait = lim.waitTime(now, estTokens);
+      if (wait > 0 && maxWaitMs > 0 && now + wait - calledAt > maxWaitMs) {
+        cancelled = true;
+        return { spill: true };
+      }
       if (wait <= 0) {
         const entry = lim.reserve(now, estTokens);
         const waited = now - start;
@@ -459,8 +471,44 @@ function acquire(model, estTokens = 0) {
     }
   });
   lim.tail = run.catch(() => {});
-  return run;
+  if (!maxWaitMs) return run;
+  // Also leave the queue at the deadline even when whoever is ahead of us is
+  // still waiting, so one slow caller cannot hold the others past their limit.
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { cancelled = true; resolve({ spill: true }); }, maxWaitMs);
+    run.then((v) => { clearTimeout(timer); resolve(v); }, () => { clearTimeout(timer); resolve({ spill: true }); });
+  });
 }
+
+// ---- overflow spill ---------------------------------------------------------
+// A model that is saturated (sonnet-5.5: 6 requests/minute) makes every extra
+// request wait for a slot. With a rule, a request that would wait longer than
+// the threshold is sent to a fallback model instead of queueing.
+// Format (FASFAS_PROXY_OVERFLOW): "sonnet-5.5=haiku-5.5:20s,other=target:5s".
+// Off by default: it swaps the model mid-conversation, so it is opt-in.
+const OVERFLOW_DEFAULT_WAIT_MS = 20000;
+
+function parseOverflow(src) {
+  const out = new Map();
+  for (const part of String(src).split(",")) {
+    const e = part.trim();
+    if (!e) continue;
+    const eq = e.indexOf("=");
+    if (eq < 0) continue;
+    const from = e.slice(0, eq).trim();
+    const [to, wait] = e.slice(eq + 1).split(":").map((s) => s.trim());
+    const maxWaitMs = wait ? parseWindow(wait) : OVERFLOW_DEFAULT_WAIT_MS;
+    if (!from || !to || from === to || !maxWaitMs) {
+      log(`ignoring malformed overflow rule "${e}"`);
+      continue;
+    }
+    out.set(from, { to, maxWaitMs });
+  }
+  return out;
+}
+
+const OVERFLOW = parseOverflow(process.env.FASFAS_PROXY_OVERFLOW || "");
+const overflowStats = new Map(); // from -> { to, count }
 
 // ---- vision handoff --------------------------------------------------------
 // A text-only target that receives image parts cannot see them. Each image is
@@ -468,7 +516,12 @@ function acquire(model, estTokens = 0) {
 // text, and the request continues to the ORIGINAL model. Captions are cached by
 // image hash, so a screenshot resent on a later turn costs nothing.
 const VISION_MODEL_DEFAULT = "glm-5.3-flash";
-const VISION_TARGETS_DEFAULT = "haiku-5.5,sonnet-5.5";
+// Every model on this gateway accepts images natively (verified: haiku and
+// sonnet name all four quadrants of a 64x64 image), so no model is captioned by
+// default. Captioning throws the pixels away, which breaks anything that needs
+// the actual image. List a model here only if it really cannot see.
+// A rejected image request still falls back to captions automatically.
+const VISION_TARGETS_DEFAULT = "";
 const VISION_PROMPT_DEFAULT =
   "Describe this image in full detail for a text-only assistant that cannot see it. " +
   "Transcribe all text, code, UI labels, error messages, tables and diagrams exactly. " +
@@ -602,9 +655,9 @@ async function analyzeImage({ auth, url }) {
 
 // Replace every image part in `rawBody` with its caption. Returns the original
 // buffer untouched when the model is not a configured target.
-async function visionHandoff(rawBody, model, auth) {
+async function visionHandoff(rawBody, model, auth, force = false) {
   if (!VISION_ENABLED || !model || model === VISION_MODEL) return rawBody;
-  if (!targetMatches(model)) return rawBody;
+  if (!force && !targetMatches(model)) return rawBody;
 
   let json;
   try { json = JSON.parse(rawBody.toString("utf8")); } catch { return rawBody; }
@@ -765,7 +818,9 @@ function readRequest(body) {
     model: typeof json?.model === "string" ? json.model : null,
     stream: json?.stream === true,
     maxTokens: json?.max_tokens ?? json?.max_completion_tokens ?? null,
-    chars: json ? JSON.stringify(json.messages || []).length : 0,
+    // Inline images are base64: a single screenshot would otherwise make an
+    // ordinary vision request look like a huge compaction prompt.
+    chars: json ? JSON.stringify(json.messages || []).replace(/data:[^"\\]+/g, "data:image").length : 0,
   };
 }
 
@@ -798,6 +853,10 @@ async function handle(req, res) {
         model: VISION_MODEL,
         targets: VISION_TARGETS,
         cachedCaptions: visionCache.size,
+      },
+      overflow: {
+        rules: Object.fromEntries([...OVERFLOW].map(([k, v]) => [k, `${v.to}:${v.maxWaitMs / 1000}s`])),
+        spills: Object.fromEntries(overflowStats),
       },
       compaction: {
         enabled: COMPACTION_ENABLED,
@@ -845,22 +904,63 @@ async function handle(req, res) {
 
     const estTokens = estimateTokens(body);
     let reservation = null;
+    let spilledFrom = null;
+
+    // Send this request to the overflow model instead of waiting on `model`.
+    const spillOver = async (why) => {
+      const rule = OVERFLOW.get(model);
+      if (!rule || spilledFrom) return false;
+      spilledFrom = model;
+      const stat = overflowStats.get(model) || { to: rule.to, count: 0 };
+      stat.to = rule.to;
+      stat.count++;
+      overflowStats.set(model, stat);
+      log(`overflow ${model} -> ${rule.to} (${why})`);
+      body = rewriteModel(body, rule.to);
+      model = rule.to;
+      reservation = null;
+      if (limiterFor(model)) {
+        PROXY_STATE.queued++;
+        try { reservation = await acquire(model, estTokens); } finally { PROXY_STATE.queued--; }
+      }
+      return true;
+    };
+
     if (isChat && model && limiterFor(model)) {
+      const rule = OVERFLOW.get(model);
       const queuedAt = Date.now();
       PROXY_STATE.queued++;
-      try { reservation = await acquire(model, estTokens); } finally { PROXY_STATE.queued--; }
-      const waited = Date.now() - queuedAt;
-      if (waited > QUEUE_LOG_MS) log(`slot for ${model} after ${(waited / 1000).toFixed(1)}s`);
+      try { reservation = await acquire(model, estTokens, rule ? rule.maxWaitMs : 0); } finally { PROXY_STATE.queued--; }
+      if (reservation && reservation.spill) {
+        await spillOver(`a slot would take over ${rule.maxWaitMs / 1000}s`);
+      } else {
+        const waited = Date.now() - queuedAt;
+        if (waited > QUEUE_LOG_MS) log(`slot for ${model} after ${(waited / 1000).toFixed(1)}s`);
+      }
     }
 
-    const maxAttempts = MAX_429_RETRIES + 1;
+    // A request that carries images may be refused upstream; if so it is retried
+    // once with the images captioned. Only possible when a vision model exists.
+    const reqJson = isChat && VISION_ENABLED ? readRequest(body).json : null;
+    let imageFallback = !!reqJson && model !== VISION_MODEL && collectImageParts(reqJson).length > 0;
+
+    const maxAttempts = MAX_429_RETRIES + 2;
     const budgetStart = Date.now();
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const result = await forward(req, res, url, body, model, isChat);
+      const result = await forward(req, res, url, body, model, isChat, {
+        headers: spilledFrom ? { "x-fasfas-overflow": `${spilledFrom}->${model}` } : {},
+        imageFallback,
+      });
       if (result.done) {
         reconcileTokens(reservation, estTokens, result.bytes);
         recordUsage(model, result, Date.now() - started);
         return;
+      }
+      if (result.visionFallback) {
+        imageFallback = false;
+        log(`upstream rejected an image request for ${model} (400); retrying with captions :: ${String(result.text).replace(/\s+/g, " ").slice(0, 160)}`);
+        body = await visionHandoff(body, model, req.headers.authorization, true);
+        continue;
       }
       if (Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
         log(`429 budget exhausted for ${model}, forwarding the 429`);
@@ -868,6 +968,11 @@ async function handle(req, res) {
       }
       const { retryMs } = learnFrom429(model, result.headers, result.text);
       PROXY_STATE.retries++;
+      const rule = OVERFLOW.get(model);
+      if (rule && !spilledFrom && retryMs > rule.maxWaitMs) {
+        await spillOver(`upstream 429, retry in ${Math.round(retryMs / 1000)}s`);
+        continue;
+      }
       log(`upstream 429 for ${model}; waiting ${Math.round(retryMs / 1000)}s (attempt ${attempt}/${maxAttempts})`);
       await sleep(retryMs);
     }
@@ -879,7 +984,7 @@ async function handle(req, res) {
 
 // One upstream attempt. Resolves {done:true} when the client has been answered,
 // or {retry:true,status,headers,text} when the 429 should be absorbed.
-function forward(req, res, url, body, model, isChat) {
+function forward(req, res, url, body, model, isChat, opts = {}) {
   return new Promise((resolve) => {
     const headers = buildForwardHeaders(req.headers, body.length);
 
@@ -912,7 +1017,7 @@ function forward(req, res, url, body, model, isChat) {
         if (!firstByteAt) firstByteAt = Date.now();
         if (status === 200) tail = (tail + c.toString("utf8")).slice(-8192);
       });
-      const hdrs = { ...upRes.headers };
+      const hdrs = { ...upRes.headers, ...(opts.headers || {}) };
       delete hdrs["transfer-encoding"];
       delete hdrs["content-length"];
       delete hdrs.connection;
@@ -929,6 +1034,9 @@ function forward(req, res, url, body, model, isChat) {
             const text = Buffer.concat(chunks).toString("utf8");
             log(`res ${status} model=${model || "-"} :: ${text.replace(/\s+/g, " ").slice(0, 400)}`);
             if (status === 429 && isChat && model) return finish({ retry: true, status, headers: upRes.headers, text });
+            // The upstream refused a request that carries images: let the caller
+            // retry once with the images captioned instead of failing the turn.
+            if (status === 400 && opts.imageFallback) return finish({ visionFallback: true, status, text });
             res.writeHead(status, hdrs);
             res.end(text);
             finish({ done: true });

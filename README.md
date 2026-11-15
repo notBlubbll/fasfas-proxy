@@ -1,10 +1,11 @@
 # fasfas-proxy
 
 An OpenCode V2 plugin (and standalone daemon) that sits between OpenCode and an
-OpenAI-compatible gateway and makes it behave: **per-model rate limiting**, image
-**captions for text-only models**, and a **compaction fallback**. Everything else
-is a transparent passthrough — the inbound `authorization` header is forwarded
-unchanged and the request body (including the model id) goes upstream byte-exact.
+OpenAI-compatible gateway and makes it behave: **per-model rate limiting**, an
+**overflow spill** when the scarce model is saturated, and a **compaction
+fallback**. Everything else is a transparent passthrough — the inbound
+`authorization` header is forwarded unchanged and the request body (including the
+model id) goes upstream byte-exact, images included.
 
 No credentials are stored in this repository.
 
@@ -23,28 +24,30 @@ tool calls:
 OpenCode surfaces that as a failed turn. The proxy reads the limit out of that
 message and paces requests locally instead, so the cap is never reached.
 
-Two smaller jobs ride along: models that cannot see images get their image parts
-captioned before forwarding, and a compaction summary that the provider blocks is
-re-run on a different model instead of killing the turn.
+Two smaller jobs ride along: a model that is saturated can spill to a fallback
+instead of queueing, and a compaction summary that the provider blocks is re-run
+on a different model instead of killing the turn.
 
 ## Models
 
-| Model | Context | Output | Image in | Req/min | Tok/min |
-| --- | --- | --- | --- | --- | --- |
-| `deepseek-v4.1-flash` | 1,048,576 | 65,536 | direct | 40 | 2,000,000 |
-| `glm-5.3-flash` | 1,048,576 | 65,536 | direct | 20 | 2,000,000 |
-| `haiku-5.5` | 1,000,000 | 65,536 | handoff | 20 | 2,000,000 |
-| `sonnet-5.5` | 1,000,000 | 65,536 | handoff | 6 | 1,000,000 |
-| `qwen3.8-27b` | 1,000,000 | 65,536 | direct | 20 | 3,000,000 |
+| Model | Context | Output | Image | Tools | Req/min | Tok/min |
+| --- | --- | --- | --- | --- | --- | --- |
+| `deepseek-v4.1-flash` | 1,048,576 | 65,536 | ✅ native | yes | 40 | 2,000,000 |
+| `glm-5.3-flash` | 1,048,576 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
+| `haiku-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
+| `sonnet-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 6 | 1,000,000 |
+| `qwen3.8-27b` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 3,000,000 |
 
 - All five speak tools, streaming and `reasoning_effort`, and expose the variants
   `low` / `medium` / `high` / `xhigh` / `max`.
 - **The limits are per model, not shared.** The aggregate ceiling is 106 req/min
   and 10M tok/min, reached only by running every model at once; saturating one
   model leaves the others untouched.
-- `haiku-5.5` and `sonnet-5.5` are text-only upstream. Declaring
-  `"input": ["text", "image"]` is what lets an image reach the proxy so it can be
-  captioned — with the proxy down, those models reject images with `400`.
+- **Images are passed through untouched.** All five models see images natively
+  (verified: haiku and sonnet name all four quadrants of a 64×64 image), so the
+  proxy only captions an image when the upstream actually rejects it.
+- `sonnet-5.5` is the scarce one at 6 requests/minute. Point subagents at
+  `deepseek-v4.1-flash` (40/min) rather than letting a fan-out eat sonnet's budget.
 
 > **Costs** in `/usage` and the panel are estimates using OpenCode's published
 > token rates. They are not what this gateway bills (it currently bills nothing).
@@ -139,23 +142,53 @@ is dropped or rejected.
 - **A prompt larger than the whole budget is still admitted.** It is clamped to
   the budget and queued behind existing traffic instead of waiting forever.
 
-## Vision handoff
+## Overflow spill
 
-When a request targets a text-only model and carries image parts:
+A saturated model makes every extra request wait for a slot. With a rule, a
+request that would wait longer than a threshold is sent to a fallback model
+instead of queueing — the same idea as the compaction handoff, applied to
+ordinary traffic.
 
-1. each image is captioned by `glm-5.3-flash`,
-2. the image part is replaced by a text part holding the caption,
-3. the request continues to the **original** model with the same `stream` flag.
+```
+FASFAS_PROXY_OVERFLOW="sonnet-5.5=haiku-5.5:20s"
+```
 
-Captions are cached by image hash (1h TTL, 200 entries), so a screenshot resent on
-a later turn costs nothing. Accepted shapes: `image_url`, `image` with
-`source.data`, and `input_image`. If the vision call fails, the image becomes
+- Off by default: it swaps the model mid-conversation, so it is opt-in.
+- The rule also applies to upstream `429`s: if the required wait exceeds the
+  threshold, the request spills immediately instead of sleeping.
+- A spilled response carries `x-fasfas-overflow: sonnet-5.5->haiku-5.5`, and the
+  log line is `overflow sonnet-5.5 -> haiku-5.5 (…)`.
+- `/status` reports the rules and a spill count per source model.
+- A request never spills twice, so a fallback cannot chain.
+
+## Images
+
+Every model on this gateway accepts images natively, so images are forwarded
+untouched — no captioning, no loss of pixels. That matters for anything that has
+to *see* the picture rather than hear about it.
+
+If an upstream does reject an image request with `400`, the proxy retries that
+request **once** with the images captioned by `glm-5.3-flash`, so a text-only
+endpoint — or a corrupt image — still gets a usable answer instead of a failed
+turn. Captions are cached by image hash (1h TTL, 200 entries).
+
+```
+upstream rejected an image request for sonnet-5.5 (400); retrying with captions :: …
+```
+
+> A `400` here is usually about the image bytes, not vision support: the
+> Anthropic-backed models validate the PNG and reject one whose chunk CRC is
+> wrong, while the GLM/Qwen/DeepSeek endpoints accept it silently.
+
+Forcing captioning for a model that is genuinely blind is opt-in:
+
+```
+FASFAS_PROXY_VISION_TARGETS="some-text-only-model"
+```
+
+Accepted image shapes for that path: `image_url`, `image` with `source.data`, and
+`input_image`. If the vision call fails, the image becomes
 `[Image attached by the user — vision analysis unavailable]` and the turn proceeds.
-
-```
-opencode run -m fasfas/haiku-5.5 --file=shot.png "what text is in the image?"
-# log: vision handoff model=haiku-5.5 images=1 analyzed=1 cached=0 bytes 47670->48069
-```
 
 ## Compaction protection
 
@@ -193,10 +226,11 @@ is unchanged outside compaction.
 | `FASFAS_PROXY_TOKEN_LIMITS` | table above | tokens: `model=tokens/window` |
 | `FASFAS_PROXY_PRICING` | table above | `model=in/out/cached`, USD per 1M tokens |
 | `FASFAS_PROXY_RL_BUDGET_MS` | `600000` | wall-clock ceiling for `429` waits per request |
-| `FASFAS_PROXY_VISION` | on | `0` disables the handoff |
-| `FASFAS_PROXY_VISION_TARGETS` | `haiku-5.5,sonnet-5.5` | text-only models to caption for (`*`, `prefix*` allowed) |
+| `FASFAS_PROXY_VISION` | on | `0` disables the caption fallback |
+| `FASFAS_PROXY_VISION_TARGETS` | (none) | models to caption for unconditionally (`*`, `prefix*` allowed) |
 | `FASFAS_PROXY_VISION_MODEL` | `glm-5.3-flash` | captioning model |
 | `FASFAS_PROXY_VISION_PROMPT` | built-in | caption prompt override |
+| `FASFAS_PROXY_OVERFLOW` | (none) | `from=to:wait` spill rules, e.g. `sonnet-5.5=haiku-5.5:20s` |
 | `FASFAS_PROXY_COMPACTION` | on | `0` disables compaction protection |
 | `FASFAS_PROXY_COMPACTION_MODEL` | `glm-5.3-flash` | fallback for blocked summaries |
 | `FASFAS_PROXY_COMPACTION_MIN_BYTES` | `20000` | prompt size that marks a tool-less request as compaction |
@@ -264,8 +298,8 @@ plugin is listed in `opencode.jsonc`: `refreshMs` (min 1000) and `usageEndpoint`
 
 ```
 8 requests to sonnet-5.5 (6/min cap)  -> 8 x 200 in 62s, zero 429s (one waited 54.4s)
-haiku-5.5 + image, direct             -> 400 upstream_rejected_request
-haiku-5.5 + image, via proxy          -> 200 "Navy" (5.8s), repeat 1.9s from caption cache
+64x64 four-quadrant image             -> haiku and sonnet named all four colours natively
+image request rejected with 400       -> retried once with captions, turn succeeded
 compaction blocked by content-filter  -> retried on glm-5.3-flash
 657k-token prompt                     -> needle found at 90% depth in 10s
 >1,048,576 tokens                     -> 400 with a clear "maximum context length" message
@@ -278,9 +312,10 @@ node test/run-tests.mjs                        # offline, mock upstream, fast
 FASFAS_API_KEY=... node test/live-check.mjs    # real gateway, real quota
 ```
 
-48 offline assertions cover passthrough and streaming, `/v1` path handling,
+64 offline assertions cover passthrough and streaming, `/v1` path handling,
 request pacing past a 2-per-second window, token budgets, per-model window
-isolation, `429` absorption, vision handoff and caption caching, compaction
+isolation, `429` absorption, images forwarded untouched, caption fallback after a
+`400`, overflow spill on both queue wait and upstream `429`, compaction
 detection/defer/fallback, and `/usage` accounting with pricing.
 
 ## Operational notes

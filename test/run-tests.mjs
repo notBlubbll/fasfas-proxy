@@ -35,6 +35,16 @@ const mock = createServer((req, res) => {
     const startedAt = Date.now();
     seen.push({ path: req.url, auth: req.headers.authorization, body, raw, startedAt });
 
+    if (req.url === "/v1/chat/completions" && body.model === "mock-imgreject" && raw.includes('"image_url"')) {
+      res.writeHead(400, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ error: { code: "upstream_rejected_request", message: "Provider returned error" } }));
+    }
+
+    if (req.url === "/v1/chat/completions" && body.model === "mock-429") {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": "30" });
+      return res.end(JSON.stringify({ error: { message: "slow down" } }));
+    }
+
     if (req.url === "/v1/chat/completions" && body.model === "mock-slow") {
       setTimeout(() => {
         seen[seen.length - 1].endedAt = Date.now();
@@ -114,7 +124,8 @@ const proxy = spawn(process.execPath, [path.join(ROOT, "index.js")], {
     ...process.env,
     FASFAS_PROXY_PORT: String(proxyPort),
     FASFAS_PROXY_UPSTREAM: `http://127.0.0.1:${mockPort}/v1`,
-    FASFAS_PROXY_LIMITS: "mock-ok=2/1000ms,mock-limited=100/1000ms,mock-textonly=0,mock-tokens=0,mock-a=1/500ms,mock-b=1/500ms",
+    FASFAS_PROXY_LIMITS: "mock-ok=2/1000ms,mock-limited=100/1000ms,mock-textonly=0,mock-tokens=0,mock-a=1/500ms,mock-b=1/500ms,mock-src=1/3000ms",
+    FASFAS_PROXY_OVERFLOW: "mock-src=mock-dst:500ms,mock-429=mock-dst:1s",
     FASFAS_PROXY_TOKEN_LIMITS: "mock-tokens=1000/1000ms",
     FASFAS_PROXY_PRICING: "mock-ok=1/2/0.5,mock-a=1/1/1,mock-b=1/1/1",
     FASFAS_PROXY_VISION_TARGETS: "mock-textonly",
@@ -354,6 +365,82 @@ log("\n/usage windows and per-model tokens");
   ok("prices the model", m.cost > 0, JSON.stringify({ cost: m.cost }));
   ok("totals cost across models", j.windows["24h"].cost > 0, JSON.stringify(j.windows["24h"]));
   ok("lifetime totals kept", !!j.lifetime?.["mock-ok"], JSON.stringify(j.lifetime));
+}
+
+const IMG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+const withImage = (model, url = IMG) => fetch(`${base}/v1/chat/completions`, {
+  method: "POST",
+  headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+  // Agent requests always carry tools; that also keeps them out of the
+  // compaction path, which the 50-char test threshold would otherwise match.
+  body: JSON.stringify({
+    model,
+    tools: [{ type: "function", function: { name: "read", description: "read", parameters: { type: "object", properties: {} } } }],
+    messages: [{ role: "user", content: [
+      { type: "text", text: "what is this?" },
+      { type: "image_url", image_url: { url } },
+    ] }],
+  }),
+});
+
+log("\nnative images are not captioned by default");
+{
+  const visionBefore = visionHits;
+  const before = seen.length;
+  const r = await withImage("mock-native");
+  const j = await r.json();
+  const call = seen.slice(before).find((c) => c.body.model === "mock-native");
+  const parts = call?.body?.messages?.[0]?.content || [];
+  ok("request succeeded", r.status === 200 && j.choices?.[0]?.message?.content === "echo:mock-native");
+  ok("image reached the model untouched", parts.some((p) => p.type === "image_url" && p.image_url?.url === IMG), JSON.stringify(parts).slice(0, 160));
+  ok("no caption was generated", visionHits === visionBefore, `vision hits ${visionHits - visionBefore}`);
+}
+
+log("\nrejected image request falls back to captions");
+{
+  const visionBefore = visionHits;
+  const before = seen.length;
+  // a fresh image: the one above is already in the caption cache
+  const r = await withImage("mock-imgreject", IMG.replace("iVBOR", "iVBOS"));
+  const j = await r.json();
+  const calls = seen.slice(before).filter((c) => c.body.model === "mock-imgreject");
+  ok("client got a 200 instead of the 400", r.status === 200, `status ${r.status}`);
+  ok("answered by the original model", j.choices?.[0]?.message?.content === "echo:mock-imgreject");
+  ok("first attempt carried the image, second the caption",
+    calls.length === 2 && calls[0].raw.includes('"image_url"') && !calls[1].raw.includes('"image_url"') && calls[1].raw.includes("TEST"),
+    `calls=${calls.length}`);
+  ok("caption model was called once", visionHits - visionBefore === 1, `hits ${visionHits - visionBefore}`);
+}
+
+log("\noverflow: a saturated model spills to the fallback");
+{
+  const run = (model) => fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
+  });
+  const r1 = await run("mock-src");
+  const j1 = await r1.json();
+  ok("first request uses the primary model", j1.choices?.[0]?.message?.content === "echo:mock-src");
+  ok("no overflow header on the primary", r1.headers.get("x-fasfas-overflow") === null);
+
+  const t0 = Date.now();
+  const r2 = await run("mock-src");
+  const j2 = await r2.json();
+  const took = Date.now() - t0;
+  ok("second request spilled to the fallback", j2.choices?.[0]?.message?.content === "echo:mock-dst", JSON.stringify(j2.choices?.[0]?.message));
+  ok("did not wait out the 3s window", took < 1500, `took ${took}ms`);
+  ok("response names the spill", r2.headers.get("x-fasfas-overflow") === "mock-src->mock-dst", String(r2.headers.get("x-fasfas-overflow")));
+
+  const t1 = Date.now();
+  const r3 = await run("mock-429");
+  const j3 = await r3.json();
+  ok("upstream 429 with a long retry spills too", j3.choices?.[0]?.message?.content === "echo:mock-dst", JSON.stringify(j3).slice(0, 120));
+  ok("did not sleep through the 30s retry-after", Date.now() - t1 < 5000, `took ${Date.now() - t1}ms`);
+
+  const st = await (await fetch(`${base}/status`)).json();
+  ok("status lists the rules", st.overflow?.rules?.["mock-src"] === "mock-dst:0.5s", JSON.stringify(st.overflow?.rules));
+  ok("status counts the spills", st.overflow?.spills?.["mock-src"]?.count >= 1 && st.overflow?.spills?.["mock-429"]?.count >= 1, JSON.stringify(st.overflow?.spills));
 }
 
 proxy.kill();
