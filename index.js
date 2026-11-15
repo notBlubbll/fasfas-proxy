@@ -68,6 +68,146 @@ const RETRY_AFTER_CAP_MS = 120000;
 // Log a line when a request had to wait this long for a slot.
 const QUEUE_LOG_MS = 5000;
 
+// ---- usage accounting -------------------------------------------------------
+// Every completed chat request appends one compact record to a JSONL file and
+// to an in-memory ring, so /usage can report 24h / 7d / 30d / all-time windows.
+// Records are pruned at 30 days; lifetime totals live in the JSON snapshot.
+const USAGE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const usage = { since: Date.now(), records: [], lifetime: {}, loaded: false };
+
+function loadUsage() {
+  if (usage.loaded) return;
+  usage.loaded = true;
+  try {
+    const snap = JSON.parse(fs.readFileSync(USAGE_FILE, "utf8"));
+    if (snap?.since) usage.since = snap.since;
+    if (snap?.lifetime) usage.lifetime = snap.lifetime;
+  } catch {}
+  try {
+    const cutoff = Date.now() - USAGE_RETENTION_MS;
+    const lines = fs.readFileSync(USAGE_LOG, "utf8").split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const r = JSON.parse(line);
+        if (r && r.t >= cutoff) usage.records.push(r);
+      } catch {}
+    }
+  } catch {}
+}
+
+let usageSaveTimer = null;
+function saveUsageSoon() {
+  if (usageSaveTimer) return;
+  usageSaveTimer = setTimeout(() => {
+    usageSaveTimer = null;
+    try {
+      fs.writeFileSync(USAGE_FILE, JSON.stringify({ since: usage.since, lifetime: usage.lifetime }));
+    } catch {}
+  }, 2000);
+  try { usageSaveTimer.unref?.(); } catch {}
+}
+
+function appendUsageRecord(rec) {
+  usage.records.push(rec);
+  try {
+    try {
+      if (fs.statSync(USAGE_LOG).size > USAGE_LOG_MAX_BYTES) fs.truncateSync(USAGE_LOG, 0);
+    } catch {}
+    fs.appendFileSync(USAGE_LOG, JSON.stringify(rec) + "\n");
+  } catch {}
+  const lt = (usage.lifetime[rec.m] = usage.lifetime[rec.m] || { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, genMs: 0 });
+  lt.requests++;
+  lt.input += rec.i || 0;
+  lt.output += rec.o || 0;
+  lt.reasoning += rec.r || 0;
+  lt.cached += rec.c || 0;
+  lt.genMs += rec.gm || 0;
+  saveUsageSoon();
+}
+
+function recordUsage(model, result, ms) {
+  if (!model || !result || result.status !== 200) return;
+  const u = parseUsageFromText(result.tail);
+  if (!u) return;
+  appendUsageRecord({
+    t: Date.now(),
+    m: model,
+    i: u.prompt,
+    o: u.completion,
+    r: u.reasoning,
+    c: u.cached,
+    gm: Math.max(0, Math.round(result.gm || 0)),
+    ms: Math.max(0, Math.round(ms)),
+  });
+}
+
+function parseUsageFromText(text) {  if (!text) return null;
+  const num = (key) => {
+    const re = new RegExp(`"${key}"\\s*:\\s*(\\d+)`, "g");
+    let last = null, m;
+    while ((m = re.exec(text))) last = Number(m[1]);
+    return last;
+  };
+  const prompt = num("prompt_tokens");
+  const completion = num("completion_tokens");
+  if (prompt == null && completion == null) return null;
+  return {
+    prompt: prompt || 0,
+    completion: completion || 0,
+    reasoning: num("reasoning_tokens") || 0,
+    cached: num("cached_tokens") || 0,
+  };
+}
+
+function pruneUsage() {
+  const cutoff = Date.now() - USAGE_RETENTION_MS;
+  if (usage.records.length === 0) return;
+  let i = 0;
+  while (i < usage.records.length && usage.records[i].t < cutoff) i++;
+  if (i > 0) usage.records.splice(0, i);
+}
+
+function windowStats(model, since) {
+  const acc = { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, genMs: 0, totalMs: 0 };
+  for (const r of usage.records) {
+    if (r.t < since) continue;
+    if (model && r.m !== model) continue;
+    acc.requests++;
+    acc.input += r.i || 0;
+    acc.output += r.o || 0;
+    acc.reasoning += r.r || 0;
+    acc.cached += r.c || 0;
+    acc.genMs += r.gm || 0;
+    acc.totalMs += r.ms || 0;
+  }
+  acc.avgTps = acc.genMs > 0 ? +(acc.output / (acc.genMs / 1000)).toFixed(1) : 0;
+  acc.avgMs = acc.requests > 0 ? Math.round(acc.totalMs / acc.requests) : 0;
+  delete acc.totalMs;
+  return acc;
+}
+
+function usageReport() {
+  pruneUsage();
+  const now = Date.now();
+  const windows = {
+    "24h": now - 24 * 60 * 60 * 1000,
+    "7d": now - 7 * 24 * 60 * 60 * 1000,
+    "30d": now - 30 * 24 * 60 * 60 * 1000,
+    all: 0,
+  };
+  const out = { since: usage.since, updated: now, windows: {}, models: {} };
+  for (const [key, since] of Object.entries(windows)) {
+    out.windows[key] = windowStats(null, since);
+    out.models[key] = {};
+    const names = new Set(usage.records.filter((r) => r.t >= since).map((r) => r.m));
+    for (const m of names) out.models[key][m] = windowStats(m, since);
+  }
+  // all-time also includes records pruned from disk, via the lifetime snapshot
+  out.lifetime = usage.lifetime;
+  return out;
+}
+
 const LOG_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-proxy.log");
 const USAGE_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-usage.json");
 const USAGE_LOG = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-usage.jsonl");
@@ -589,6 +729,10 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/healthz") {
     return send(res, 200, "text/plain", "fasfas-proxy OK\n");
   }
+  if (req.method === "GET" && url.pathname === "/usage") {
+    return send(res, 200, "application/json", JSON.stringify(usageReport(), null, 2) + "\n",
+      { "cache-control": "no-store", "access-control-allow-origin": "*" });
+  }
   if (req.method === "GET" && url.pathname === "/status") {
     const now = Date.now();
     const models = {};
@@ -667,6 +811,7 @@ async function handle(req, res) {
       const result = await forward(req, res, url, body, model, isChat);
       if (result.done) {
         reconcileTokens(reservation, estTokens, result.bytes);
+        recordUsage(model, result, Date.now() - started);
         return;
       }
       if (Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
@@ -692,6 +837,8 @@ function forward(req, res, url, body, model, isChat) {
 
     let settled = false;
     let respBytes = 0;
+    let firstByteAt = 0;
+    let tail = "";
     const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
 
     let up;
@@ -712,7 +859,11 @@ function forward(req, res, url, body, model, isChat) {
 
     up.on("response", (upRes) => {
       const status = upRes.statusCode || 502;
-      upRes.on("data", (c) => { respBytes += c.length; });
+      upRes.on("data", (c) => {
+        respBytes += c.length;
+        if (!firstByteAt) firstByteAt = Date.now();
+        if (status === 200) tail = (tail + c.toString("utf8")).slice(-8192);
+      });
       const hdrs = { ...upRes.headers };
       delete hdrs["transfer-encoding"];
       delete hdrs["content-length"];
@@ -746,8 +897,8 @@ function forward(req, res, url, body, model, isChat) {
       log(`res ${status} model=${model || "-"} ct=${hdrs["content-type"] || "-"}`);
       res.writeHead(status, hdrs);
       upRes.pipe(res);
-      upRes.on("end", () => finish({ done: true, bytes: respBytes }));
-      upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, bytes: respBytes }); });
+      upRes.on("end", () => finish({ done: true, status, bytes: respBytes, tail, gm: firstByteAt ? Date.now() - firstByteAt : 0 }));
+      upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, gm: firstByteAt ? Date.now() - firstByteAt : 0 }); });
     });
 
     res.on("close", () => {
@@ -942,6 +1093,7 @@ function sendJson(res, status, text) {
 // ---- server ----------------------------------------------------------------
 
 async function startServer(port, mode) {
+  loadUsage();
   const server = createServer();
   server.on("request", (req, res) => {
     handle(req, res).catch((err) => {

@@ -211,9 +211,58 @@ compaction handoff model=glm-5.3-flash status=200 finish=stop bytes=4821
 Normal tool-carrying requests are never buffered or rerouted, so streaming
 latency is unchanged outside compaction.
 
+## Desktop usage panel
+
+`desktop-usage-panel/` adds a **Fasfas usage** tab to the OpenCode Desktop session
+side region (the experimental GUI plugin API, no app patching).
+
+Columns per model: requests, input tokens, output tokens, reasoning tokens,
+cached tokens, average output tok/s and average latency. A window switch selects
+**24h / 7d / 30d / all**, and the header carries a **↻ refresh** button beside
+the auto-refresh (every 5s by default).
+
+Install by copying the folder next to the proxy plugin:
+
+```
+~/.config/opencode/plugins/fasfas-usage/
+├── index.js               # server part (id: fasfas-usage, no behavior)
+└── gui-experimental.cjs   # the panel
+```
+
+Then restart the desktop window: the GUI bundle is read when a window starts.
+Open the panel from the **+** menu of the side region, or from the command
+palette ("Fasfas usage").
+
+Options, when the plugin is listed in `opencode.jsonc` instead of auto-discovered:
+
+```jsonc
+{
+  "plugins": [
+    { "package": "fasfas-usage", "options": { "refreshMs": 5000, "usageEndpoint": "http://127.0.0.1:17331/usage" } }
+  ]
+}
+```
+
+`refreshMs` is clamped to at least 1000. Data comes from the proxy's `GET /usage`
+and is kept for 30 days in `.fasfas-usage.jsonl` (aggregate snapshot in
+`.fasfas-usage.json`).
+
 ## Endpoints
 
 - `GET /healthz` → `fasfas-proxy OK`
+- `GET /usage` → per-model usage for `24h`, `7d`, `30d` and `all`:
+
+```json
+{
+  "windows": { "24h": { "requests": 2, "input": 1387, "output": 138, "cached": 640, "avgTps": 38.3, "avgMs": 9340 } },
+  "models": {
+    "24h": {
+      "glm-5.3-flash": { "requests": 1, "input": 681, "output": 75, "reasoning": 15, "cached": 0, "avgTps": 128.4, "avgMs": 9509 }
+    }
+  },
+  "lifetime": { "glm-5.3-flash": { "requests": 1, "input": 681, "output": 75 } }
+}
+```
 - `GET /status` (CORS, `no-store`):
 
 ```json

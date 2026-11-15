@@ -340,6 +340,19 @@ log("\nlimits are per model, not shared");
     JSON.stringify({ a: st.models["mock-a"]?.total, b: st.models["mock-b"]?.total }));
 }
 
+log("\n/usage windows and per-model tokens");
+{
+  const r = await fetch(`${base}/usage`);
+  const j = await r.json();
+  ok("24h window has requests", j.windows?.["24h"]?.requests >= 1, JSON.stringify(j.windows?.["24h"]));
+  ok("7d/30d/all windows exist", !!j.windows?.["7d"] && !!j.windows?.["30d"] && !!j.windows?.all);
+  ok("per-model row recorded", !!j.models?.["24h"]?.["mock-ok"], JSON.stringify(Object.keys(j.models?.["24h"] || {})));
+  const m = j.models?.["24h"]?.["mock-ok"] || {};
+  ok("counts input tokens", m.input > 0, JSON.stringify(m));
+  ok("reports average tps", typeof m.avgTps === "number", JSON.stringify(m));
+  ok("lifetime totals kept", !!j.lifetime?.["mock-ok"], JSON.stringify(j.lifetime));
+}
+
 proxy.kill();
 mock.close();
 log(`\n${passed} passed, ${failed} failed`);
