@@ -287,6 +287,9 @@ observations can describe; re-running replaces the previous seeds.
 - one row per model — requests, in, out, reasoning, cached, tok/s, latency, cost;
 - a totals row with the same padding as the model rows;
 - a `24h | 7d | 30d | all` switch, a **↻** refresh button and 5s auto-refresh;
+- a composer pill while the routed session is working:
+  `Working (12s · retrying 2 · HTTP 502)`, the retry part appearing only when the
+  proxy is re-sending a request;
 - opens from the side region's **+** menu or the command palette.
 
 It is an experimental GUI plugin (`gui-experimental.cjs`), prebuilt as CommonJS

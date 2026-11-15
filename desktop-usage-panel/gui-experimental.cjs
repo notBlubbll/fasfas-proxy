@@ -17,6 +17,34 @@ const { createSignal } = require("solid-js");
 // Live retry state from the proxy's /status, read by the composer pill. One
 // signal for every window, refreshed once a second.
 const [proxyStatus, setProxyStatus] = createSignal(null);
+// One shared 1s ticker; reading `tick()` in a pill makes the host re-run it.
+const [tick, setTick] = createSignal(0);
+
+function formatSeconds(total) {
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+// Elapsed time of the routed session, or null when it is not working.
+function elapsedSeconds(session) {
+  const data = session && session.server && session.server.data;
+  if (!data) return null;
+  const id = session.id;
+  let running = false;
+  try {
+    running = typeof data.session.status === "function" && data.session.status(id) === "running";
+  } catch {}
+  const info = data.session.get(id);
+  const busy = info && info.time && info.time.busy;
+  const idle = info && info.time && info.time.idle;
+  const byTime = typeof busy === "number" && (typeof idle !== "number" || busy > idle);
+  if (!running && !byTime) return null;
+  if (typeof busy !== "number") return 0;
+  const elapsed = Math.floor((Date.now() - busy) / 1000);
+  return elapsed >= 0 && elapsed < 24 * 60 * 60 ? elapsed : 0;
+}
 
 const WINDOWS = ["24h", "7d", "30d", "all"];
 const COLUMNS = [
@@ -300,8 +328,7 @@ module.exports = {
       const key = `${ctx.id}:usage`;
       const statusUrl = endpoint.replace(/\/usage\/?$/, "/status");
 
-      // Composer pill: "Retrying 2 · HTTP 502" while the proxy is re-sending the
-      // routed session's request after a transient upstream failure.
+      // Proxy retry state for the pill: poll /status once a second.
       const statusTimer = setInterval(async () => {
         try {
           const r = await fetch(statusUrl, { cache: "no-store" });
@@ -311,18 +338,27 @@ module.exports = {
         }
       }, 1000);
 
+      // Composer pill, the working timer: elapsed time for the routed session,
+      // plus the proxy's retry state when it is re-sending a request.
+      const tickTimer = setInterval(() => setTick((n) => n + 1), 1000);
+
       ctx.add(ComposerPill, {
-        id: "retrying",
+        id: "working",
         order: 5,
         show: (input) => {
+          tick();
+          const seconds = elapsedSeconds(input.session);
+          if (seconds === null) return undefined;
           const s = proxyStatus();
           const e = s && s.sessions && input.session ? s.sessions[input.session.id] : null;
-          if (!e) return undefined;
+          const suffix = e ? ` · retrying ${e.retries} · HTTP ${e.status}` : "";
           return {
-            label: `Retrying ${e.retries} · HTTP ${e.status}`,
+            label: `Working (${formatSeconds(seconds)}${suffix})`,
             icon: "status",
-            tone: "warning",
-            title: `${e.model || "request"} returned ${e.status}; the proxy is retrying`,
+            tone: e ? "warning" : undefined,
+            title: e
+              ? `${e.model || "request"} returned ${e.status}; the proxy is retrying`
+              : "Session is running",
           };
         },
       });
@@ -370,7 +406,10 @@ module.exports = {
         run: open,
       }));
 
-      return () => clearInterval(statusTimer);
+      return () => {
+        clearInterval(statusTimer);
+        clearInterval(tickTimer);
+      };
     },
   }),
 };
