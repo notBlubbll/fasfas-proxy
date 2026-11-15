@@ -11,7 +11,12 @@
 //
 // Plain DOM, no JSX and no build step: the panel builds its nodes once and
 // updates them in place.
-const { Plugin, Panel, MenuItem, Command } = require("@opencode/plugin/gui");
+const { Plugin, Panel, MenuItem, Command, ComposerPill } = require("@opencode/plugin/gui");
+const { createSignal } = require("solid-js");
+
+// Live retry state from the proxy's /status, read by the composer pill. One
+// signal for every window, refreshed once a second.
+const [proxyStatus, setProxyStatus] = createSignal(null);
 
 const WINDOWS = ["24h", "7d", "30d", "all"];
 const COLUMNS = [
@@ -293,6 +298,34 @@ module.exports = {
       const endpoint = (ctx.options && ctx.options.usageEndpoint) || "http://127.0.0.1:17331/usage";
       const refreshMs = Math.max(1000, Number(ctx.options && ctx.options.refreshMs) || 5000);
       const key = `${ctx.id}:usage`;
+      const statusUrl = endpoint.replace(/\/usage\/?$/, "/status");
+
+      // Composer pill: "Retrying 2 · HTTP 502" while the proxy is re-sending the
+      // routed session's request after a transient upstream failure.
+      const statusTimer = setInterval(async () => {
+        try {
+          const r = await fetch(statusUrl, { cache: "no-store" });
+          setProxyStatus(r.ok ? await r.json() : null);
+        } catch {
+          setProxyStatus(null);
+        }
+      }, 1000);
+
+      ctx.add(ComposerPill, {
+        id: "retrying",
+        order: 5,
+        show: (input) => {
+          const s = proxyStatus();
+          const e = s && s.sessions && input.session ? s.sessions[input.session.id] : null;
+          if (!e) return undefined;
+          return {
+            label: `Retrying ${e.retries} · HTTP ${e.status}`,
+            icon: "status",
+            tone: "warning",
+            title: `${e.model || "request"} returned ${e.status}; the proxy is retrying`,
+          };
+        },
+      });
 
       const tab = {
         id: "usage",
@@ -336,6 +369,8 @@ module.exports = {
         section: "navigation",
         run: open,
       }));
+
+      return () => clearInterval(statusTimer);
     },
   }),
 };

@@ -100,6 +100,8 @@ function recordCost(r) {
 
 // Retries after an upstream 429 before the 429 is handed to the client.
 const MAX_429_RETRIES = 6;
+// Retries for transient 5xx (502/503/504/520/522/524) before giving up.
+const MAX_5XX_RETRIES = 5;
 // Wall-clock ceiling for 429 waits on a single request.
 const RATE_LIMIT_BUDGET_MS = Number(process.env.FASFAS_PROXY_RL_BUDGET_MS) || 10 * 60 * 1000;
 // Never trust a retry-after beyond this; a stuck upstream must not park a turn.
@@ -699,7 +701,34 @@ async function visionHandoff(rawBody, model, auth, force = false) {
 
 // ---- upstream plumbing -----------------------------------------------------
 
-const PROXY_STATE = { active: 0, queued: 0, started: Date.now(), requests: 0, retries: 0 };
+const PROXY_STATE = { active: 0, queued: 0, started: Date.now(), requests: 0, retries: 0, retries5xx: 0 };
+
+// Live retry state per OpenCode session, for the composer pill. Keyed by the
+// x-opencode-session-id header OpenCode sends with every request.
+const sessionRetries = new Map();
+
+function noteSessionRetry(sessionId, status, model) {
+  if (!sessionId) return;
+  const e = sessionRetries.get(sessionId) || { retries: 0, status: status, model: model, since: Date.now(), updated: Date.now() };
+  e.retries++;
+  e.status = status;
+  e.model = model;
+  e.updated = Date.now();
+  sessionRetries.set(sessionId, e);
+}
+
+function clearSessionRetry(sessionId) {
+  if (sessionId) sessionRetries.delete(sessionId);
+}
+
+function sessionRetryReport(now) {
+  const out = {};
+  for (const [id, e] of sessionRetries) {
+    if (now - e.updated > 5 * 60 * 1000) { sessionRetries.delete(id); continue; }
+    out[id] = { retries: e.retries, status: e.status, model: e.model, ageMs: now - e.since };
+  }
+  return out;
+}
 
 function upstreamRequest(target, opts) {
   const mod = target.protocol === "https:" ? httpsRequest : httpRequest;
@@ -858,6 +887,8 @@ async function handle(req, res) {
         rules: Object.fromEntries([...OVERFLOW].map(([k, v]) => [k, `${v.to}:${v.maxWaitMs / 1000}s`])),
         spills: Object.fromEntries(overflowStats),
       },
+      sessions: sessionRetryReport(now),
+      retries5xx: PROXY_STATE.retries5xx || 0,
       compaction: {
         enabled: COMPACTION_ENABLED,
         handoffModel: COMPACTION_MODEL,
@@ -877,6 +908,7 @@ async function handle(req, res) {
   let meta = readRequest(body);
   let model = meta.model;
   const isChat = url.pathname.includes("/chat/completions");
+  const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"] || null;
   const started = Date.now();
 
   log(`req ${req.method} ${url.pathname} model=${model || "-"} stream=${meta.stream} bytes=${body.length} max_tokens=${meta.maxTokens ?? "default"}`);
@@ -945,11 +977,13 @@ async function handle(req, res) {
     let imageFallback = !!reqJson && model !== VISION_MODEL && collectImageParts(reqJson).length > 0;
 
     const maxAttempts = MAX_429_RETRIES + 2;
+    let serverAttempts = 0;
     const budgetStart = Date.now();
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const result = await forward(req, res, url, body, model, isChat, {
         headers: spilledFrom ? { "x-fasfas-overflow": `${spilledFrom}->${model}` } : {},
         imageFallback,
+        retry5xx: true,
       });
       if (result.done) {
         reconcileTokens(reservation, estTokens, result.bytes);
@@ -960,6 +994,22 @@ async function handle(req, res) {
         imageFallback = false;
         log(`upstream rejected an image request for ${model} (400); retrying with captions :: ${String(result.text).replace(/\s+/g, " ").slice(0, 160)}`);
         body = await visionHandoff(body, model, req.headers.authorization, true);
+        continue;
+      }
+      if (result.serverError) {
+        // 5xx from the gateway or its CDN. Usually transient; retry the same
+        // body with backoff, and record it per session for the UI.
+        const attemptNo = (serverAttempts += 1);
+        PROXY_STATE.retries5xx = (PROXY_STATE.retries5xx || 0) + 1;
+        noteSessionRetry(sessionId, result.status, model);
+        if (attemptNo > MAX_5XX_RETRIES || Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
+          log(`upstream ${result.status} for ${model} after ${attemptNo - 1} retries; forwarding it (${body.length} bytes)`);
+          clearSessionRetry(sessionId);
+          return sendJson(res, result.status, result.text);
+        }
+        const wait = Math.min(500 * 2 ** (attemptNo - 1), 15000);
+        log(`upstream ${result.status} for ${model} (${body.length} bytes); retrying in ${wait / 1000}s (attempt ${attemptNo}/${MAX_5XX_RETRIES})`);
+        await sleep(wait);
         continue;
       }
       if (Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
@@ -977,6 +1027,7 @@ async function handle(req, res) {
       await sleep(retryMs);
     }
   } finally {
+    clearSessionRetry(sessionId);
     PROXY_STATE.active--;
     log(`done ${url.pathname} model=${model || "-"} in ${Date.now() - started}ms`);
   }
@@ -1034,6 +1085,8 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
             const text = Buffer.concat(chunks).toString("utf8");
             log(`res ${status} model=${model || "-"} :: ${text.replace(/\s+/g, " ").slice(0, 400)}`);
             if (status === 429 && isChat && model) return finish({ retry: true, status, headers: upRes.headers, text });
+            // Transient 5xx: let the caller retry the same body.
+            if (status >= 500 && isChat && opts.retry5xx) return finish({ serverError: true, status, headers: upRes.headers, text });
             // The upstream refused a request that carries images: let the caller
             // retry once with the images captioned instead of failing the turn.
             if (status === 400 && opts.imageFallback) return finish({ visionFallback: true, status, text });

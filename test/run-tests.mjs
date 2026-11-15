@@ -24,6 +24,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const seen = [];            // { path, auth, body }
 let limitedHits = 0;
 let visionHits = 0;
+let fivexxHits = 0;
 
 const mock = createServer((req, res) => {
   const chunks = [];
@@ -38,6 +39,14 @@ const mock = createServer((req, res) => {
     if (req.url === "/v1/chat/completions" && body.model === "mock-imgreject" && raw.includes('"image_url"')) {
       res.writeHead(400, { "content-type": "application/json" });
       return res.end(JSON.stringify({ error: { code: "upstream_rejected_request", message: "Provider returned error" } }));
+    }
+
+    if (req.url === "/v1/chat/completions" && body.model === "mock-5xx") {
+      fivexxHits++;
+      if (fivexxHits <= 2) {
+        res.writeHead(502, { "content-type": "text/plain" });
+        return res.end("error code: 502");
+      }
     }
 
     if (req.url === "/v1/chat/completions" && body.model === "mock-429") {
@@ -441,6 +450,26 @@ log("\noverflow: a saturated model spills to the fallback");
   const st = await (await fetch(`${base}/status`)).json();
   ok("status lists the rules", st.overflow?.rules?.["mock-src"] === "mock-dst:0.5s", JSON.stringify(st.overflow?.rules));
   ok("status counts the spills", st.overflow?.spills?.["mock-src"]?.count >= 1 && st.overflow?.spills?.["mock-429"]?.count >= 1, JSON.stringify(st.overflow?.spills));
+}
+
+log("\ntransient 5xx is retried with backoff");
+{
+  const before = fivexxHits;
+  const t0 = Date.now();
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json", "x-opencode-session-id": "ses_5xx_test" },
+    body: JSON.stringify({ model: "mock-5xx", messages: [{ role: "user", content: "hi" }] }),
+  });
+  const j = await r.json();
+  ok("client sees 200 after two 502s", r.status === 200, `status ${r.status}`);
+  ok("answered by the original model", j.choices?.[0]?.message?.content === "echo:mock-5xx");
+  ok("three attempts were made", fivexxHits - before === 3, `hits ${fivexxHits - before}`);
+  ok("backoff was applied", Date.now() - t0 >= 700, `took ${Date.now() - t0}ms`);
+
+  const st = await (await fetch(`${base}/status`)).json();
+  ok("status counts 5xx retries", st.retries5xx >= 2, String(st.retries5xx));
+  ok("session retry state cleared after success", !st.sessions?.ses_5xx_test, JSON.stringify(st.sessions));
 }
 
 proxy.kill();
