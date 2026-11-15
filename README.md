@@ -247,6 +247,31 @@ Options, when the plugin is listed in `opencode.jsonc` instead of auto-discovere
 and is kept for 30 days in `.fasfas-usage.jsonl` (aggregate snapshot in
 `.fasfas-usage.json`).
 
+## Seeding history
+
+The proxy only knows about requests it has carried. To backfill from the
+provider's billing page:
+
+```sh
+node scripts/seed-usage.mjs --dir ~/.config/opencode/plugins/fasfas-proxy \
+  --data scripts/billing-2026-11-15.json --hours 2
+```
+
+The JSON is a map of model id → totals:
+
+```json
+{ "haiku-5.5": { "requests": 121, "input": 1916305, "output": 3792 } }
+```
+
+Each entry becomes one seed record stamped `--hours` ago (default 2, so it lands
+inside the 24h window). Seeded records count their full request and token totals
+but are excluded from the average TPS and latency, which only real observations
+can describe. Re-running replaces the previous seed records instead of
+duplicating them, and the proxy reloads the log on restart.
+
+`scripts/billing-2026-11-15.json` holds the snapshot that was imported
+(641 requests, 9,341,717 tokens).
+
 ## Endpoints
 
 - `GET /healthz` → `fasfas-proxy OK`

@@ -1,0 +1,7 @@
+{
+  "deepseek-v4.1-flash": { "requests": 151, "input": 1662400, "output": 4828 },
+  "glm-5.3-flash": { "requests": 119, "input": 833707, "output": 14243 },
+  "haiku-5.5": { "requests": 121, "input": 1916305, "output": 3792 },
+  "qwen3.8-27b": { "requests": 139, "input": 281498, "output": 14534 },
+  "sonnet-5.5": { "requests": 111, "input": 4578856, "output": 31554 }
+}

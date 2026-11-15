@@ -169,21 +169,28 @@ function pruneUsage() {
 }
 
 function windowStats(model, since) {
-  const acc = { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, genMs: 0, totalMs: 0 };
+  const acc = { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, seeded: 0 };
+  let realOutput = 0, realGenMs = 0, realMs = 0, realReq = 0;
   for (const r of usage.records) {
     if (r.t < since) continue;
     if (model && r.m !== model) continue;
-    acc.requests++;
+    acc.requests += r.n || 1;
     acc.input += r.i || 0;
     acc.output += r.o || 0;
     acc.reasoning += r.r || 0;
     acc.cached += r.c || 0;
-    acc.genMs += r.gm || 0;
-    acc.totalMs += r.ms || 0;
+    if (r.seed) {
+      // Imported aggregate: real token counts, no timing to average.
+      acc.seeded++;
+      continue;
+    }
+    realReq++;
+    realOutput += r.o || 0;
+    realGenMs += r.gm || 0;
+    realMs += r.ms || 0;
   }
-  acc.avgTps = acc.genMs > 0 ? +(acc.output / (acc.genMs / 1000)).toFixed(1) : 0;
-  acc.avgMs = acc.requests > 0 ? Math.round(acc.totalMs / acc.requests) : 0;
-  delete acc.totalMs;
+  acc.avgTps = realGenMs > 0 ? +(realOutput / (realGenMs / 1000)).toFixed(1) : 0;
+  acc.avgMs = realReq > 0 ? Math.round(realMs / realReq) : 0;
   return acc;
 }
 
