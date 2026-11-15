@@ -29,26 +29,25 @@ re-run on a different model instead of killing the turn.
 
 ## Models
 
-| Model | Context | Output | Image in | Req/min | Tok/min | $/Mtok in · out · cached |
-| --- | --- | --- | --- | --- | --- | --- |
-| `deepseek-v4.1-flash` | 1,048,576 | 65,536 | direct | 40 | 2,000,000 | 0.15 · 0.60 · 0.003 |
-| `glm-5.3-flash` | 1,048,576 | 65,536 | direct | 20 | 2,000,000 | 0.15 · 0.50 · 0.03 |
-| `haiku-5.5` | 1,000,000 | 65,536 | handoff | 20 | 2,000,000 | 0.10 · 0.50 · 0.01 |
-| `sonnet-5.5` | 1,000,000 | 65,536 | handoff | 6 | 1,000,000 | 2.00 · 10.00 · 0.10 |
-| `qwen3.8-27b` | 1,000,000 | 65,536 | direct | 20 | 3,000,000 | 0.15 · 0.47 · 0.016 |
+| Model | Context | Output | Image in | Req/min | Tok/min |
+| --- | --- | --- | --- | --- | --- |
+| `deepseek-v4.1-flash` | 1,048,576 | 65,536 | direct | 40 | 2,000,000 |
+| `glm-5.3-flash` | 1,048,576 | 65,536 | direct | 20 | 2,000,000 |
+| `haiku-5.5` | 1,000,000 | 65,536 | handoff | 20 | 2,000,000 |
+| `sonnet-5.5` | 1,000,000 | 65,536 | handoff | 6 | 1,000,000 |
+| `qwen3.8-27b` | 1,000,000 | 65,536 | direct | 20 | 3,000,000 |
 
 - All five speak tools, streaming and `reasoning_effort`, and expose the variants
   `low` / `medium` / `high` / `xhigh` / `max`.
 - **The limits are per model, not shared.** The aggregate ceiling is 106 req/min
   and 10M tok/min, reached only by running every model at once; saturating one
   model leaves the others untouched.
-- Prices come from [OpenCode Go](https://opencode.ai/docs/go#usage-limits), the
-  closest published rates. `deepseek-v4.1-flash` uses the off-peak row (peak is
-  0.30 / 1.20 / 0.006), and `qwen3.8-27b` borrows the Qwen3.8 Flash rates because
-  it has no published price of its own.
 - `haiku-5.5` and `sonnet-5.5` are text-only upstream. Declaring
   `"input": ["text", "image"]` is what lets an image reach the proxy so it can be
   captioned — with the proxy down, those models reject images with `400`.
+
+> **Costs** in `/usage` and the panel are estimates using OpenCode's published
+> token rates. They are not what this gateway bills (it currently bills nothing).
 
 Everything in the table is overridable by the env vars below.
 
