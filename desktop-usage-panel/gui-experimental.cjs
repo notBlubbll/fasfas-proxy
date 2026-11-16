@@ -276,12 +276,23 @@ function buildPanel(endpoint, refreshMs, headingText) {
     const s = slots[name];
     if (!s || !s.max) return el;
     const used = Math.min(s.used || 0, s.max);
+    const width = Math.max(2, String(s.max).length);
+    const pad = (n) => String(n).padStart(width, "0");
+
     const tag = document.createElement("span");
-    tag.textContent = ` (${used}/${s.max})`;
-    tag.style.cssText = used >= s.max ? "opacity:.95;font-weight:650" : "opacity:.55";
+    tag.textContent = `[${pad(used)}/${pad(s.max)}] `;
+    tag.style.cssText = used >= s.max
+      ? "opacity:.95;font-weight:650;font-variant-numeric:tabular-nums"
+      : "opacity:.5;font-variant-numeric:tabular-nums";
     tag.title = `${used} of ${s.max} requests in the window` +
       (s.tokenMax ? ` · ${Math.round((s.tokensUsed || 0) / 1000)}k of ${Math.round(s.tokenMax / 1000)}k tokens` : "");
+
+    const label = document.createElement("span");
+    label.textContent = name;
+
+    el.textContent = "";
     el.appendChild(tag);
+    el.appendChild(label);
     return el;
   }
 
