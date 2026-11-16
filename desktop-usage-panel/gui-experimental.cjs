@@ -271,7 +271,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     tbl.style.cssText = "width:100%;border-collapse:collapse;font-size:12px;user-select:text;-webkit-user-select:text;cursor:text";
     const head = document.createElement("tr");
     head.appendChild(th("Session", "left"));
-    head.appendChild(th("Key", "right"));
+    head.appendChild(th("Key", "center", "the key this session is pinned to; all its requests use that key's limits"));
     head.appendChild(th("Model", "left"));
     head.appendChild(th("State", "left"));
     head.appendChild(th("Req", "right", "requests this session has made since the proxy started"));
@@ -287,7 +287,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       name.title = s.id;
       tr.appendChild(name);
 
-      tr.appendChild(td(s.key ? String(s.key) : "–", "right", { last, muted: !s.key }));
+      tr.appendChild(td(s.key ? `Key ${s.key}` : "no key", "center", { last, muted: !s.key, strong: s.active > 0 }));
 
       // A session that overflowed shows the model actually serving it, with a *
       // and the model it was meant for in the tooltip.
