@@ -656,10 +656,11 @@ const SESSION_PIN_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const sessionActivity = new Map();
 
 function touchSession(sid, model) {
-  const a = sessionActivity.get(sid) || { last: 0, active: 0, requests: 0, model: null };
+  const a = sessionActivity.get(sid) || { last: 0, active: 0, requests: 0, model: null, spilledFrom: null };
   a.last = Date.now();
   a.requests++;
   if (model) a.model = model;
+  a.spilledFrom = null; // a spill only lasts for the request that made it
   sessionActivity.set(sid, a);
   saveKeysSoon();
   return a;
@@ -803,6 +804,7 @@ function keysReport() {
       active: a.active,
       requests: a.requests,
       model: a.model,
+      from: a.spilledFrom || null,
       idleMs: Math.max(0, now - a.last),
     });
   }
@@ -1470,6 +1472,7 @@ async function handle(req, res) {
       model = rule.to;
       spill = { target: rule.to, from };
       markOverflowActive(rule.to, from);
+      if (sessionAct) { sessionAct.model = rule.to; sessionAct.spilledFrom = from; }
       reservation = null;
       if (limiterFor(model, keySlot)) {
         PROXY_STATE.queued++;

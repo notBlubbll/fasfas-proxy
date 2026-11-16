@@ -267,26 +267,37 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       return;
     }
     const here = sessionId();
-    for (const s of sessions) {
-      const row = document.createElement("div");
-      row.style.cssText = "display:grid;grid-template-columns:50px minmax(0,1fr) auto;gap:8px;align-items:center";
-      row.title = s.id;
+    const tbl = document.createElement("table");
+    tbl.style.cssText = "width:100%;border-collapse:collapse;font-size:12px;user-select:text;-webkit-user-select:text;cursor:text";
+    const head = document.createElement("tr");
+    head.appendChild(th("Session", "left"));
+    head.appendChild(th("Key", "right"));
+    head.appendChild(th("Model", "left"));
+    head.appendChild(th("State", "left"));
+    head.appendChild(th("Req", "right", "requests this session has made since the proxy started"));
+    tbl.appendChild(head);
 
-      const badge = document.createElement("span");
-      badge.textContent = s.key ? `Key ${s.key}` : "no key";
-      badge.style.cssText = [
-        "padding:1px 0", "border-radius:6px", "text-align:center", "font-size:11px", "font-weight:650",
-        "border:1px solid rgba(127,127,127,.35)",
-        s.key ? "background:rgba(127,127,127,.12)" : "opacity:.55",
-      ].join(";");
+    sessions.forEach((s, i) => {
+      const last = i === sessions.length - 1;
+      const tr = document.createElement("tr");
+      tr.title = s.id;
 
-      const name = document.createElement("span");
       const title = titleOf(s.id) || `${s.id.slice(0, 8)}…${s.id.slice(-4)}`;
-      name.textContent = title + (s.id === here ? "  · this one" : "");
-      name.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" + (s.id === here ? "font-weight:650" : "");
+      const name = td(title + (s.id === here ? "  · this one" : ""), "left", { last, strong: s.id === here, model: true });
+      name.title = s.id;
+      tr.appendChild(name);
 
-      const state = document.createElement("span");
-      state.style.cssText = "font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums";
+      tr.appendChild(td(s.key ? String(s.key) : "–", "right", { last, muted: !s.key }));
+
+      // A session that overflowed shows the model actually serving it, with a *
+      // and the model it was meant for in the tooltip.
+      const spilled = !!s.from && !!s.model;
+      tr.appendChild(td(s.model ? s.model + (spilled ? " *" : "") : "–", "left", {
+        last, muted: !s.model, model: true,
+        title: spilled ? `overflow: ${s.from} was full, so this session's request runs on ${s.model}` : (s.model || ""),
+      }));
+
+      const state = td("", "left", { last });
       if (s.active > 0) {
         state.textContent = `● ${s.active} running`;
         state.style.color = "rgb(80,170,110)";
@@ -295,14 +306,15 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
         state.textContent = `idle ${idleText(s.idleMs)}`;
         state.style.opacity = ".5";
       }
-      if (s.model) state.title = `last model: ${s.model} · ${s.requests} request(s) this run`;
+      state.style.fontVariantNumeric = "tabular-nums";
+      tr.appendChild(state);
 
-      row.appendChild(badge);
-      row.appendChild(name);
-      row.appendChild(state);
-      sessionsList.appendChild(row);
-    }
+      tr.appendChild(td(String(s.requests || 0), "right", { last, muted: true }));
+      tbl.appendChild(tr);
+    });
+    sessionsList.appendChild(tbl);
   }
+
   renderSessions();
 
   // ---- manual ping ---------------------------------------------------------
@@ -600,6 +612,8 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   let error = null;
   // Live slot usage per model: used requests in the current window vs the cap.
   let slots = {};
+  // model -> { count, from[] } for overflow traffic in flight (from /status).
+  let overflowActive = {};
 
   function slotCell(el, name) {
     const s = slots[name];
@@ -616,8 +630,11 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     tag.title = `${used} of ${s.max} requests in the window` +
       (s.tokenMax ? ` · ${Math.round((s.tokensUsed || 0) / 1000)}k of ${Math.round(s.tokenMax / 1000)}k tokens` : "");
 
+    // `*` while this model is serving requests that overflowed from another one.
+    const spill = overflowActive[name];
     const label = document.createElement("span");
-    label.textContent = name;
+    label.textContent = name + (spill ? " *" : "");
+    if (spill) label.title = `serving overflow from ${spill.from.join(", ")} (${spill.count} in flight)`;
 
     el.textContent = "";
     el.appendChild(tag);
@@ -775,8 +792,10 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       // Slot usage for the model column: live limiter state, plus the configured
       // caps so a model with no traffic yet still shows "0/6".
       slots = {};
+      overflowActive = {};
       if (statusRes && statusRes.ok) {
         const s = await statusRes.json();
+        overflowActive = (s.overflow && s.overflow.active) || {};
         for (const [name, v] of Object.entries(s.models || {})) {
           slots[name] = { used: v.used || 0, max: v.max || 0, tokensUsed: v.tokensUsed || 0, tokenMax: v.tokenMax || 0 };
         }

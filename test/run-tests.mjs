@@ -495,6 +495,17 @@ log("\noverflow: a saturated model spills to the fallback");
   const st = await (await fetch(`${base}/status`)).json();
   ok("status lists the rules", st.overflow?.rules?.["mock-src"] === "mock-dst:0.5s", JSON.stringify(st.overflow?.rules));
   ok("status counts the spills", st.overflow?.spills?.["mock-src"]?.count >= 1 && st.overflow?.spills?.["mock-429"]?.count >= 1, JSON.stringify(st.overflow?.spills));
+
+  // A spilled session shows the model that served it, and where it came from.
+  const sid = "ses_spill_model";
+  await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json", "x-opencode-session-id": sid },
+    body: JSON.stringify({ model: "mock-src", messages: [{ role: "user", content: "hi" }] }),
+  }).then((x) => x.text());
+  const k = await (await fetch(`${base}/keys`)).json();
+  const s = k.sessions.find((x) => x.id === sid);
+  ok("session shows the model that served it", s && s.model === "mock-dst" && s.from === "mock-src", JSON.stringify(s));
 }
 
 log("\ntransient 5xx is retried with backoff");

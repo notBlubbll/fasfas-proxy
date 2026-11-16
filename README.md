@@ -248,8 +248,10 @@ which keeps one credential only as the fallback).
   request.
 - **Totals scale with keys.** `/status` and the panel report the per-key cap times
   the number of keys, so one key shows the original numbers and two show double.
-- The panel lists live sessions with their title, key and running/idle state, and
-  each key row has **Show**, **Edit**, **Pin** (glue the open session to it) and
+- The panel lists live sessions as a table: session, key, model, state and request
+  count. A session whose request overflowed shows the model that served it with a
+  `*` (the tooltip names the model it was meant for), and the main table marks a
+  model with `*` while it is serving overflow from another. Each key row has **Show**, **Edit**, **Pin** (glue the open session to it) and
   **×**.
 
 ## Configuration
