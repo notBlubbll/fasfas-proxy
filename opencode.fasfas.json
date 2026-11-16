@@ -273,6 +273,63 @@
                         "output": 65536
                     }
                 },
+                "gemini-4hy": {
+                    "name": "Gemini 4 Hydrogen (preview)",
+                    "cost": {
+                        "input": 1.5,
+                        "output": 7.5,
+                        "cache_read": 0.075
+                    },
+                    "capabilities": {
+                        "tools": true,
+                        "input": [
+                            "text",
+                            "image"
+                        ],
+                        "output": [
+                            "text"
+                        ]
+                    },
+                    "compatibility": {
+                        "reasoningField": "reasoning"
+                    },
+                    "variants": [
+                        {
+                            "id": "low",
+                            "settings": {
+                                "reasoningEffort": "low"
+                            }
+                        },
+                        {
+                            "id": "medium",
+                            "settings": {
+                                "reasoningEffort": "medium"
+                            }
+                        },
+                        {
+                            "id": "high",
+                            "settings": {
+                                "reasoningEffort": "high"
+                            }
+                        },
+                        {
+                            "id": "xhigh",
+                            "settings": {
+                                "reasoningEffort": "xhigh"
+                            }
+                        },
+                        {
+                            "id": "max",
+                            "settings": {
+                                "reasoningEffort": "max"
+                            }
+                        }
+                    ],
+                    "limit": {
+                        "context": 1000000,
+                        "output": 65536
+                    }
+                },
                 "mai-image-2.6-flash": {
                     "name": "MAI Image 2.6 Flash",
                     "capabilities": {
