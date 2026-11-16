@@ -35,7 +35,6 @@ on a different model instead of killing the turn.
 | `deepseek-v4.1-flash` | 1,048,576 | 65,536 | ✅ native | yes | 40 | 2,000,000 |
 | `glm-5.3-flash` | 1,048,576 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
 | `glm-5.2` | 1,048,576 | 65,536 | ✅ native | yes | 10 | 1,000,000 |
-| `gemini-4hy` (preview) | 1,000,000 | 65,536 | ✅ native | yes | 20 | 3,000,000 |
 | `haiku-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
 | `sonnet-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 6 | 1,000,000 |
 | `qwen3.8-27b` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 3,000,000 |
@@ -45,12 +44,9 @@ on a different model instead of killing the turn.
 > keys, so two keys double what `/status` and the panel report. One key shows the
 > original numbers.
 
-- `gemini-4hy` (Gemini 4 Hydrogen) is a **preview**: the gateway lists it, but at
-  the time of writing its upstream rejects requests (`0 endpoints ... available
-  matching your guardrail restrictions and data policy`, ZDR). Its limits come
-  from the gateway dashboard. `mai-image-2.6` and `mai-image-2.6-flash` are image
-  generation (`POST /v1/images/generations`), passed through and counted, with no
-  token limits.
+- `mai-image-2.6` and `mai-image-2.6-flash` are image generation
+  (`POST /v1/images/generations`), passed through and counted, with no token
+  limits.
 - All the chat models speak tools, streaming and `reasoning_effort`, and expose the variants
   `low` / `medium` / `high` / `xhigh` / `max`.
 - **The limits are per model, not shared.** The aggregate ceiling is 106 req/min
