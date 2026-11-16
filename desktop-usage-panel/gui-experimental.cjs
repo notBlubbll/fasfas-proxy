@@ -668,7 +668,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       ? "opacity:.95;font-weight:650;font-variant-numeric:tabular-nums"
       : "opacity:.5;font-variant-numeric:tabular-nums";
     tag.title = `${used} of ${s.max} requests in the window` +
-      (s.tokenMax ? ` · ${Math.round((s.tokensUsed || 0) / 1000)}k of ${Math.round(s.tokenMax / 1000)}k tokens` : "");
+      (s.tokenMax ? ` · ${fmt(s.tokensUsed || 0)} of ${fmt(s.tokenMax)} tokens (${(((s.tokensUsed || 0) / s.tokenMax) * 100).toFixed(1)}%)` : "");
 
     // `*` while this model is serving requests that overflowed from another one.
     const spill = overflowActive[name];
@@ -847,9 +847,18 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
         for (const [name, v] of Object.entries(s.models || {})) {
           slots[name] = { used: v.used || 0, max: v.max || 0, tokensUsed: v.tokensUsed || 0, tokenMax: v.tokenMax || 0 };
         }
+        // Models with no traffic yet have no live limiter: take both caps from the
+        // configured limits so every row shows its request and token ceiling.
+        const tokenCap = (name) => {
+          const t = /^(\d+)\//.exec(String((s.tokenLimits || {})[name] || ""));
+          return t ? Number(t[1]) : 0;
+        };
         for (const [name, spec] of Object.entries(s.limits || {})) {
           const m = /^(\d+)\//.exec(String(spec));
-          if (m && !slots[name]) slots[name] = { used: 0, max: Number(m[1]), tokensUsed: 0, tokenMax: 0 };
+          if (m && !slots[name]) slots[name] = { used: 0, max: Number(m[1]), tokensUsed: 0, tokenMax: tokenCap(name) };
+        }
+        for (const [name, v] of Object.entries(slots)) {
+          if (!v.tokenMax) v.tokenMax = tokenCap(name);
         }
       }
     } catch (e) {
