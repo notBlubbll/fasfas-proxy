@@ -47,15 +47,22 @@ function elapsedSeconds(session) {
 }
 
 const WINDOWS = ["24h", "7d", "30d", "all"];
+// Shown in place of a saved key. The real value is only fetched on Show.
+const KEY_MASK = "••••••••••••••••";
 const COLUMNS = [
   { key: "model", label: "Model", align: "left" },
   { key: "requests", label: "Req", align: "right" },
   { key: "input", label: "In", align: "right" },
   { key: "output", label: "Out", align: "right" },
   { key: "reasoning", label: "Reason", align: "right" },
-  { key: "cached", label: "Cached", align: "right" },
-  { key: "avgTps", label: "tok/s", align: "right" },
-  { key: "avgMs", label: "avg", align: "right" },
+  { key: "cached", label: "Cached", align: "right",
+    title: "Share of input tokens served from the provider's prompt cache: cached ÷ input. Input already includes the cached tokens." },
+  { key: "avgTps", label: "tok/s", align: "right",
+    title: "Decode speed: output tokens after the first one ÷ time between the first and last streamed token. Excludes time to first token, and replies under 16 tokens." },
+  { key: "ttftMs", label: "ttft", align: "right",
+    title: "Time to first token: from sending the request to the first streamed text, averaged." },
+  { key: "avgMs", label: "avg", align: "right",
+    title: "Average total request time, start to finish." },
   { key: "cost", label: "$", align: "right" },
 ];
 
@@ -67,6 +74,53 @@ function fmt(n) {
   return String(v);
 }
 
+// Latencies are shown in seconds everywhere: 13888 ms reads as 13.888s, and
+// anything under a second keeps three decimals so short calls stay readable.
+function secs(ms) {
+  const v = Number(ms) || 0;
+  if (v <= 0) return "—";
+  return (v / 1000).toFixed(3) + "s";
+}
+
+// Cached share of the prompt. The gateway reports prompt tokens including the
+// cached ones (OpenAI-style usage), so the ratio is simply cached / input.
+function cachedPct(cached, input) {
+  const c = Number(cached) || 0;
+  const i = Number(input) || 0;
+  if (i <= 0) return "—";
+  return ((c / i) * 100).toFixed(1) + "%";
+}
+
+function cachedTitle(cached, input) {
+  const c = Number(cached) || 0;
+  const i = Number(input) || 0;
+  if (i <= 0) return "no input tokens in this window";
+  return `${c.toLocaleString()} cached ÷ ${i.toLocaleString()} input tokens = ${((c / i) * 100).toFixed(2)}%\n` +
+    "Imported history is left out: it has no cache data. Claude models only cache when the request carries cache_control (compatibility.cacheFormat).";
+}
+
+function tpsTitle(s) {
+  if (!s || !s.avgTps) return "no streamed replies long enough to measure yet";
+  return [
+    `average ${s.avgTps} tok/s (all measured tokens ÷ all generation time)`,
+    `mean of requests ${s.meanTps || 0} · median ${s.medTps || 0} · latest ${s.lastTps || 0}`,
+    `${s.tpsN || 0} request(s) measured`,
+  ].join("\n");
+}
+
+// "3m", "42s", "2h": how long a session has been quiet.
+function idleText(ms) {
+  const s = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  return Math.floor(s / 3600) + "h";
+}
+
+function ttftTitle(s) {
+  if (!s || !s.ttftMs) return "no streamed replies to measure yet";
+  return `average over ${s.ttftN || 0} request(s)`;
+}
+
 function money(n) {
   const v = Number(n) || 0;
   if (v === 0) return "$0.00";
@@ -76,9 +130,12 @@ function money(n) {
 
 const BORDER = "1px solid rgba(127,127,127,.18)";
 
-function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
+function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   const sessionId = () => {
     try { return typeof getSessionId === "function" ? getSessionId() : null; } catch { return null; }
+  };
+  const titleOf = (id) => {
+    try { return typeof getTitle === "function" ? getTitle(id) : null; } catch { return null; }
   };
   const root = document.createElement("div");
   root.style.cssText = [
@@ -184,6 +241,70 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
   footer.style.cssText = "margin-top:auto;padding-top:6px;opacity:.5;font-size:11px";
   root.appendChild(footer);
 
+  // ---- sessions ------------------------------------------------------------
+  // Who is using which key right now. One session is glued to one key, so this is
+  // also the answer to "which key is busy".
+  let sessions = [];
+  const sessionsBox = document.createElement("div");
+  sessionsBox.style.cssText = "border-top:" + BORDER + ";padding-top:10px;display:flex;flex-direction:column;gap:6px";
+  const sessionsHead = document.createElement("div");
+  sessionsHead.textContent = "Sessions";
+  sessionsHead.style.cssText = "font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;opacity:.55";
+  const sessionsList = document.createElement("div");
+  sessionsList.style.cssText = "display:flex;flex-direction:column;gap:3px";
+  sessionsBox.appendChild(sessionsHead);
+  sessionsBox.appendChild(sessionsList);
+  // Sits between the table and the footer, i.e. in the middle of the panel.
+  root.insertBefore(sessionsBox, footer);
+
+  function renderSessions() {
+    sessionsList.textContent = "";
+    if (!sessions.length) {
+      const empty = document.createElement("div");
+      empty.textContent = "no sessions in the last 30 minutes";
+      empty.style.cssText = "opacity:.5;font-size:11px";
+      sessionsList.appendChild(empty);
+      return;
+    }
+    const here = sessionId();
+    for (const s of sessions) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:grid;grid-template-columns:50px minmax(0,1fr) auto;gap:8px;align-items:center";
+      row.title = s.id;
+
+      const badge = document.createElement("span");
+      badge.textContent = s.key ? `Key ${s.key}` : "no key";
+      badge.style.cssText = [
+        "padding:1px 0", "border-radius:6px", "text-align:center", "font-size:11px", "font-weight:650",
+        "border:1px solid rgba(127,127,127,.35)",
+        s.key ? "background:rgba(127,127,127,.12)" : "opacity:.55",
+      ].join(";");
+
+      const name = document.createElement("span");
+      const title = titleOf(s.id) || `${s.id.slice(0, 8)}…${s.id.slice(-4)}`;
+      name.textContent = title + (s.id === here ? "  · this one" : "");
+      name.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" + (s.id === here ? "font-weight:650" : "");
+
+      const state = document.createElement("span");
+      state.style.cssText = "font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums";
+      if (s.active > 0) {
+        state.textContent = `● ${s.active} running`;
+        state.style.color = "rgb(80,170,110)";
+        state.style.fontWeight = "650";
+      } else {
+        state.textContent = `idle ${idleText(s.idleMs)}`;
+        state.style.opacity = ".5";
+      }
+      if (s.model) state.title = `last model: ${s.model} · ${s.requests} request(s) this run`;
+
+      row.appendChild(badge);
+      row.appendChild(name);
+      row.appendChild(state);
+      sessionsList.appendChild(row);
+    }
+  }
+  renderSessions();
+
   // ---- manual ping ---------------------------------------------------------
   // One tiny prompt per model at the push of a button, to see which models are
   // alive and what each calls itself.
@@ -243,7 +364,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
         name.style.cssText = "flex:0 0 auto;opacity:.65;min-width:130px";
         const body = document.createElement("span");
         if (p.ok) {
-          body.textContent = `${(p.text || "").replace(/\s+/g, " ").slice(0, 90)} · ${p.ms}ms`;
+          body.textContent = `${(p.text || "").replace(/\s+/g, " ").slice(0, 90)} · ${secs(p.ms)}`;
         } else {
           body.textContent = p.skipped ? `skipped — ${p.error}` : `failed — ${p.error}`;
           body.style.opacity = ".6";
@@ -290,121 +411,189 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
 
   const keyNote = document.createElement("div");
   keyNote.style.cssText = "opacity:.5;font-size:11px";
-  keyNote.textContent = "saved to .fasfas-keys.json — each session sticks to one key";
+  keyNote.textContent = "saved to keys.json - each session sticks to one key";
   keyBox.appendChild(keyNote);
   root.appendChild(keyBox);
 
+  // Rows exist only for keys that are configured. Each row is one masked field
+  // and four actions: Show reveals the value, Edit makes the field editable
+  // (Save applies it), Pin glues the routed session to that key, × removes it.
+  const keyCss = {
+    field: [
+      "width:100%", "box-sizing:border-box", "height:26px", "padding:0 8px", "border-radius:7px",
+      "border:1px solid rgba(127,127,127,.35)", "background:transparent", "color:inherit",
+      "font:inherit", "font-variant-numeric:tabular-nums",
+    ].join(";"),
+    button: [
+      "height:26px", "padding:0 8px", "border-radius:7px", "border:1px solid rgba(127,127,127,.35)",
+      "background:rgba(127,127,127,.08)", "color:inherit", "cursor:pointer", "font:inherit",
+      "font-weight:600", "white-space:nowrap",
+    ].join(";"),
+  };
+  const keyButton = (text, title, extra) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = text;
+    b.title = title || "";
+    b.style.cssText = keyCss.button + ";" + (extra || "");
+    return b;
+  };
+  const keyPlaceholder = () => {
+    const s = document.createElement("span");
+    s.style.visibility = "hidden";
+    return s;
+  };
+  let keySig = "";
+
   function renderKeys() {
     keyList.textContent = "";
-    // Two fixed slots, plus one more whenever the pool grows past them.
-    const slotCount = Math.max(2, keys.length);
-    for (let i = 1; i <= slotCount; i++) {
-      const current = keys[i - 1];
+    if (keys.length === 0) {
+      const empty = document.createElement("div");
+      empty.textContent = "no keys yet — OpenCode's own credential is used until you add one";
+      empty.style.cssText = "opacity:.5;font-size:11px";
+      keyList.appendChild(empty);
+      return;
+    }
+    const rowStyle = "display:grid;grid-template-columns:minmax(0,1fr) 58px 58px 62px 26px;gap:6px;align-items:center";
 
+    keys.forEach((current, idx) => {
+      const i = idx + 1;
       const row = document.createElement("div");
-      row.style.cssText = "display:flex;gap:6px;align-items:center";
-
-      const label = document.createElement("span");
-      label.textContent = `Key ${i}`;
-      label.style.cssText = "flex:0 0 auto;min-width:42px;opacity:.65;font-size:11px";
+      row.style.cssText = rowStyle;
 
       const input = document.createElement("input");
       input.type = "password";
-      input.placeholder = current ? current.hint : "not set";
-      input.style.cssText = [
-        "flex:1", "min-width:0", "padding:4px 8px", "border-radius:7px",
-        "border:1px solid rgba(127,127,127,.35)", "background:transparent", "color:inherit", "font:inherit",
-      ].join(";");
+      input.readOnly = true;
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.value = KEY_MASK;
+      input.title = current.hint;
+      input.style.cssText = keyCss.field;
 
-      const apply = () => {
-        const v = input.value.trim();
-        if (!v) return;
-        input.value = "";
-        saveKeys({ set: i, key: v });
+      let editing = false;
+      const reveal = keyButton("Show", `Show key ${i}`);
+      reveal.onclick = async () => {
+        if (editing) return;
+        if (input.type === "text") {
+          input.type = "password";
+          input.value = KEY_MASK;
+          reveal.textContent = "Show";
+          return;
+        }
+        try {
+          const r = await fetch(`${keysUrl}/reveal?slot=${i}`, { cache: "no-store" });
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+          input.type = "text";
+          input.value = j.key;
+          reveal.textContent = "Hide";
+        } catch (e) {
+          keyNote.textContent = "reveal failed: " + ((e && e.message) || "unreachable");
+        }
       };
 
-      const set = document.createElement("button");
-      set.type = "button";
-      set.textContent = current ? "Replace" : "Set";
-      set.style.cssText = [
-        "padding:4px 9px", "border-radius:7px", "border:1px solid rgba(127,127,127,.35)",
-        "background:rgba(127,127,127,.08)", "color:inherit", "cursor:pointer", "font:inherit", "font-weight:600",
-      ].join(";");
-      set.onclick = apply;
-
-      row.appendChild(label);
-      row.appendChild(input);
-      row.appendChild(set);
+      const finishEdit = () => {
+        editing = false;
+        input.readOnly = true;
+        input.type = "password";
+        input.value = KEY_MASK;
+        input.placeholder = "";
+        edit.textContent = "Edit";
+        reveal.style.opacity = "1";
+        reveal.disabled = false;
+      };
+      const edit = keyButton("Edit", `Edit key ${i}`);
+      edit.onclick = () => {
+        if (!editing) {
+          editing = true;
+          input.readOnly = false;
+          input.type = "password";
+          input.value = "";
+          input.placeholder = "new key";
+          edit.textContent = "Save";
+          reveal.style.opacity = ".45";
+          reveal.disabled = true;
+          input.focus();
+          return;
+        }
+        const v = input.value.trim();
+        if (!v) { finishEdit(); return; }
+        saveKeys({ set: i, key: v });
+      };
+      input.onkeydown = (e) => {
+        if (!editing) return;
+        if (e.key === "Enter") { e.preventDefault(); edit.onclick(); }
+        if (e.key === "Escape") { e.preventDefault(); finishEdit(); }
+      };
 
       // Pin the routed session to this key: its requests then follow this key's
       // windows, which is how two sessions double the available capacity.
-      if (current) {
-        const sid = sessionId();
-        const isPinned = !!sid && Number(pins[sid]) === i;
-        const pin = document.createElement("button");
-        pin.type = "button";
-        pin.textContent = isPinned ? "Pinned" : "Pin";
-        pin.title = sid ? `Use key ${i} for this session` : "Open a session first";
-        pin.disabled = !sid;
-        pin.style.cssText = [
-          "padding:4px 9px", "border-radius:7px",
-          "border:1px solid " + (isPinned ? "rgba(120,200,140,.65)" : "rgba(127,127,127,.35)"),
-          "background:" + (isPinned ? "rgba(120,200,140,.16)" : "transparent"),
-          "color:inherit", "cursor:" + (sid ? "pointer" : "default"),
-          "font:inherit", "font-weight:600", "opacity:" + (sid ? "1" : ".45"),
-        ].join(";");
-        pin.onclick = () => {
-          const id = sessionId();
-          if (id) saveKeys({ pin: { session: id, key: i } });
-        };
-        row.appendChild(pin);
-      }
+      const sid = sessionId();
+      const isPinned = !!sid && Number(pins[sid]) === i;
+      const pinCell = keyButton(isPinned ? "Pinned" : "Pin",
+        sid ? `Use key ${i} for this session` : "Open a session first",
+        isPinned ? "border:1px solid rgba(120,200,140,.65);background:rgba(120,200,140,.16)" : "");
+      pinCell.disabled = !sid;
+      pinCell.style.opacity = sid ? "1" : ".45";
+      pinCell.style.cursor = sid ? "pointer" : "default";
+      pinCell.onclick = () => {
+        const id = sessionId();
+        if (id) saveKeys({ pin: { session: id, key: i } });
+      };
 
-      if (current) {
-        const del = document.createElement("button");
-        del.type = "button";
-        del.textContent = "×";
-        del.title = `Remove key ${i}`;
-        del.style.cssText = [
-          "padding:0 7px", "border-radius:6px", "border:1px solid rgba(127,127,127,.3)",
-          "background:transparent", "color:inherit", "cursor:pointer", "font:inherit", "line-height:1.5",
-        ].join(";");
-        del.onclick = () => saveKeys({ remove: i });
-        row.appendChild(del);
-      }
+      const delCell = keyButton("×", `Remove key ${i}`, "padding:0");
+      delCell.onclick = () => saveKeys({ remove: i });
 
+      row.appendChild(input);
+      row.appendChild(reveal);
+      row.appendChild(edit);
+      row.appendChild(pinCell);
+      row.appendChild(delCell);
       keyList.appendChild(row);
-    }
+    });
   }
 
+  // Add row at the bottom: one field, one button.
+  const addRow = document.createElement("div");
+  addRow.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) 58px;gap:6px;align-items:center;margin-top:4px";
+  const addInput = document.createElement("input");
+  addInput.type = "password";
+  addInput.autocomplete = "off";
+  addInput.spellcheck = false;
+  addInput.placeholder = "paste a key to add…";
+  addInput.style.cssText = keyCss.field;
+  const addBtn = keyButton("Add", "Add a key");
+  const doAdd = () => {
+    const v = addInput.value.trim();
+    if (!v) return;
+    addInput.value = "";
+    saveKeys({ add: v });
+  };
+  addBtn.onclick = doAdd;
+  addInput.onkeydown = (e) => {
+    if (e.key === "Enter") { e.preventDefault(); doAdd(); }
+  };
+  addRow.appendChild(addInput);
+  addRow.appendChild(addBtn);
+  keyBox.appendChild(addRow);
+
+  // Saves never touch the add field or the rows' edit state: they only update the
+  // key list, pins, and the note.
   async function saveKeys(payload) {
-    keyAdd.disabled = true;
     try {
       const r = await fetch(keysUrl, { method: "POST", cache: "no-store", body: JSON.stringify(payload) });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
       keys = j.keys || [];
+      pins = j.pins || {};
+      keySig = JSON.stringify([keys, pins, sessionId()]);
       renderKeys();
-      keyNote.textContent = "saved to .fasfas-keys.json — each session sticks to one key";
+      keyNote.textContent = "saved to keys.json - each session sticks to one key";
     } catch (e) {
       keyNote.textContent = "key update failed: " + ((e && e.message) || "unreachable");
-    } finally {
-      keyAdd.disabled = false;
     }
   }
 
-  keyAdd.onclick = () => {
-    const v = keyInput.value.trim();
-    if (!v) return;
-    keyInput.value = "";
-    saveKeys({ add: v });
-  };
-  keyInput.onkeydown = (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      keyAdd.onclick();
-    }
-  };
   renderKeys();
 
   let data = null;
@@ -436,7 +625,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
     return el;
   }
 
-  function th(text, align) {
+  function th(text, align, title) {
     const el = document.createElement("th");
     el.textContent = text;
     el.style.cssText = [
@@ -447,7 +636,9 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
       "font-size:11px",
       "opacity:.6",
       "white-space:nowrap",
+      title ? "cursor:help" : "",
     ].join(";");
+    if (title) el.title = title;
     return el;
   }
 
@@ -464,6 +655,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
       opts.model ? "max-width:190px;overflow:hidden;text-overflow:ellipsis" : "",
     ].join(";");
     if (opts.model) el.title = text;
+    if (opts.title) el.title = opts.title;
     return el;
   }
 
@@ -498,7 +690,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
 
     const thead = document.createElement("thead");
     const hr = document.createElement("tr");
-    for (const c of COLUMNS) hr.appendChild(th(c.label, c.align));
+    for (const c of COLUMNS) hr.appendChild(th(c.label, c.align, c.title));
     thead.appendChild(hr);
     table.appendChild(thead);
 
@@ -512,9 +704,10 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
       tr.appendChild(td(fmt(m.input), "right"));
       tr.appendChild(td(fmt(m.output), "right"));
       tr.appendChild(td(fmt(m.reasoning), "right"));
-      tr.appendChild(td(fmt(m.cached), "right"));
-      tr.appendChild(td(String(m.avgTps || 0), "right", { muted: !m.avgTps }));
-      tr.appendChild(td(m.avgMs ? m.avgMs + "ms" : "—", "right", { muted: !m.avgMs }));
+      tr.appendChild(td(cachedPct(m.cachedReal, m.inputReal), "right", { title: cachedTitle(m.cachedReal, m.inputReal) }));
+      tr.appendChild(td(m.avgTps ? String(m.avgTps) : "—", "right", { muted: !m.avgTps, title: tpsTitle(m) }));
+      tr.appendChild(td(secs(m.ttftMs), "right", { muted: !m.ttftMs, title: ttftTitle(m) }));
+      tr.appendChild(td(secs(m.avgMs), "right", { muted: !m.avgMs }));
       tr.appendChild(td(money(m.cost), "right"));
       body.appendChild(tr);
     }
@@ -530,9 +723,10 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
     tr.appendChild(td(fmt(w.input), "right", { strong: true, last: true }));
     tr.appendChild(td(fmt(w.output), "right", { strong: true, last: true }));
     tr.appendChild(td(fmt(w.reasoning), "right", { strong: true, last: true }));
-    tr.appendChild(td(fmt(w.cached), "right", { strong: true, last: true }));
-    tr.appendChild(td(String(w.avgTps || 0), "right", { strong: true, last: true }));
-    tr.appendChild(td(w.avgMs ? w.avgMs + "ms" : "—", "right", { strong: true, last: true }));
+    tr.appendChild(td(cachedPct(w.cachedReal, w.inputReal), "right", { strong: true, last: true, title: cachedTitle(w.cachedReal, w.inputReal) }));
+    tr.appendChild(td(w.avgTps ? String(w.avgTps) : "—", "right", { strong: true, last: true, title: tpsTitle(w) }));
+    tr.appendChild(td(secs(w.ttftMs), "right", { strong: true, last: true, title: ttftTitle(w) }));
+    tr.appendChild(td(secs(w.avgMs), "right", { strong: true, last: true }));
     tr.appendChild(td(money(w.cost), "right", { strong: true, last: true }));
     tfoot.appendChild(tr);
     table.appendChild(tfoot);
@@ -561,10 +755,20 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
       error = null;
       if (keysRes && keysRes.ok) {
         const kj = await keysRes.json();
+        if (Array.isArray(kj.sessions)) {
+          sessions = kj.sessions;
+          renderSessions();
+        }
         if (Array.isArray(kj.keys)) {
           keys = kj.keys;
           pins = kj.pins || {};
-          renderKeys();
+          // Re-render only when something the rows show has changed, so an open
+          // Edit is not rebuilt by the 5-second poll.
+          const sig = JSON.stringify([keys, pins, sessionId()]);
+          if (sig !== keySig) {
+            keySig = sig;
+            renderKeys();
+          }
         }
       }
 
@@ -669,6 +873,12 @@ module.exports = {
         render: () => buildPanel(endpoint, refreshMs, ctx.t("heading"), () => {
           const s = ctx.sessions && ctx.sessions.current ? ctx.sessions.current() : null;
           return s && s.id ? s.id : null;
+        }, (id) => {
+          // The title comes from the app's own session data, which knows every
+          // session the server has, not just the one on screen.
+          const s = ctx.sessions && ctx.sessions.current ? ctx.sessions.current() : null;
+          const info = s && s.server && s.server.data && s.server.data.session && s.server.data.session.get(id);
+          return (info && (info.title || info.name)) || null;
         }),
       });
 

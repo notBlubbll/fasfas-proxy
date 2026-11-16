@@ -8,6 +8,13 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import os from "node:os";
+import fs from "node:fs";
+
+// The proxy keeps keys and session pins in a file. Tests get their own, so a run
+// can never inherit pins from an earlier one or touch the repo's real state.
+const KEYS_FILE = path.join(os.tmpdir(), `fasfas-test-keys-${process.pid}.json`);
+try { fs.unlinkSync(KEYS_FILE); } catch {}
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const log = (...a) => console.log(...a);
@@ -52,6 +59,38 @@ const mock = createServer((req, res) => {
     if (req.url === "/v1/chat/completions" && body.model === "mock-429") {
       res.writeHead(429, { "content-type": "application/json", "retry-after": "30" });
       return res.end(JSON.stringify({ error: { message: "slow down" } }));
+    }
+
+    // Streams `count` text frames `gapMs` apart, then a usage frame. 24 frames at
+    // 40ms is 23 gaps = ~920ms, so 23 tokens after the first -> ~25 tok/s.
+    const streamTokens = (count, gapMs, usageObj) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      let i = 0;
+      const timer = setInterval(() => {
+        if (i < count) {
+          res.write(`data: {"choices":[{"index":0,"delta":{"content":"t${i}"}}]}\n\n`);
+          i++;
+          return;
+        }
+        clearInterval(timer);
+        res.write(`data: ${JSON.stringify({ choices: [], usage: usageObj })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }, gapMs);
+    };
+    if (req.url === "/v1/chat/completions" && body.model === "mock-tps") {
+      return streamTokens(24, 40, { prompt_tokens: 100, completion_tokens: 24, total_tokens: 124, prompt_tokens_details: { cached_tokens: 40 } });
+    }
+    if (req.url === "/v1/chat/completions" && body.model === "mock-short") {
+      return streamTokens(6, 100, { prompt_tokens: 10, completion_tokens: 6, total_tokens: 16 });
+    }
+    if (req.url === "/v1/chat/completions" && body.model === "mock-burst") {
+      // The whole reply in a single write: there is no generation window to time.
+      let all = "";
+      for (let i = 0; i < 24; i++) all += `data: {"choices":[{"index":0,"delta":{"content":"t${i}"}}]}\n\n`;
+      all += `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 24, total_tokens: 34 } })}\n\ndata: [DONE]\n\n`;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      return res.end(all);
     }
 
     if (req.url === "/v1/chat/completions" && body.model === "mock-slow") {
@@ -132,6 +171,7 @@ const proxy = spawn(process.execPath, [path.join(ROOT, "index.js")], {
   env: {
     ...process.env,
     FASFAS_PROXY_PORT: String(proxyPort),
+    FASFAS_PROXY_KEYS_FILE: KEYS_FILE,
     FASFAS_PROXY_UPSTREAM: `http://127.0.0.1:${mockPort}/v1`,
     FASFAS_PROXY_LIMITS: "mock-ok=2/1000ms,mock-limited=100/1000ms,mock-textonly=0,mock-tokens=0,mock-a=1/500ms,mock-b=1/500ms,mock-src=1/3000ms",
     FASFAS_PROXY_OVERFLOW: "mock-src=mock-dst:500ms,mock-429=mock-dst:1s",
@@ -489,9 +529,18 @@ log("\nmanual ping endpoint");
 
 log("\nkey pool");
 {
+  // Pins persist in the keys file beside the proxy, so clear the session ids this
+  // block uses; otherwise an earlier run decides where they land.
+  for (const sid of ["ses_alpha", "ses_beta", "ses_pinned", "ses_after"]) {
+    await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ unpin: sid }) });
+  }
   let r = await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ keys: ["sk-test-aaaa1111", "sk-test-bbbb2222"] }) });
   let j = await r.json();
   ok("two keys stored", j.keys?.length === 2, JSON.stringify(j));
+
+  const st2 = await (await fetch(`${base}/status`)).json();
+  ok("account total doubles with two keys", st2.limits?.["mock-a"] === "2/0.5s" && st2.keys === 2,
+    JSON.stringify({ keys: st2.keys, limit: st2.limits?.["mock-a"] }));
   ok("keys come back masked", j.keys.map((k) => k.hint).join(",") === "…1111,…2222", JSON.stringify(j.keys));
 
   const chat = (headers) => fetch(`${base}/v1/chat/completions`, {
@@ -526,6 +575,47 @@ log("\nkey pool");
   const afterPin = seen[seen.length - 1].auth;
   ok("pinned session follows the chosen key", afterPin === (target === 1 ? "Bearer sk-test-aaaa1111" : "Bearer sk-test-bbbb2222"), afterPin);
 
+  const rv = await fetch(`${base}/keys/reveal?slot=1`);
+  const rvj = await rv.json();
+  ok("reveal returns one key to a local client", rv.status === 200 && rvj.key === "sk-test-aaaa1111", JSON.stringify(rvj));
+  const web = await fetch(`${base}/keys/reveal?slot=1`, { headers: { origin: "https://evil.example" } });
+  ok("reveal refuses a browser page origin", web.status === 403, String(web.status));
+  const miss = await fetch(`${base}/keys/reveal?slot=9`);
+  ok("reveal rejects an unknown slot", miss.status === 404, String(miss.status));
+
+  // A session's requests use its own key's window only. Saturate key A's window
+  // for mock-src (limit 1 per 3s) with one session, then a session on the other
+  // key must still be served at once.
+  const pinA = "ses_isolate_a", pinB = "ses_isolate_b";
+  await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ pin: { session: pinA, key: 1 } }) });
+  await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ pin: { session: pinB, key: 2 } }) });
+  const sendAs = (sid) => fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer inbound-key", "content-type": "application/json", "x-opencode-session-id": sid },
+    body: JSON.stringify({ model: "mock-src", messages: [{ role: "user", content: "hi" }] }),
+  }).then((x) => x.json());
+  await sendAs(pinA);
+  const tB = Date.now();
+  const bj = await sendAs(pinB);
+  ok("a session on the other key is not held by key 1's window",
+    Date.now() - tB < 1500 && bj.choices?.[0]?.message?.content === "echo:mock-src",
+    `took ${Date.now() - tB}ms`);
+
+  // New sessions take the key with fewer sessions.
+  const fresh = "ses_least_loaded";
+  await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ unpin: fresh }) });
+  const kBefore = await (await fetch(`${base}/keys`)).json();
+  const counts = kBefore.keys.map((k) => k.sessions);
+  const leastIdx = counts.indexOf(Math.min(...counts)) + 1;
+  await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer inbound-key", "content-type": "application/json", "x-opencode-session-id": fresh },
+    body: JSON.stringify({ model: "mock-ok", messages: [{ role: "user", content: "hi" }] }),
+  }).then((x) => x.text());
+  const kAfter = await (await fetch(`${base}/keys`)).json();
+  ok("a new session lands on the key with fewer sessions",
+    kAfter.pins[fresh] === leastIdx, `counts ${JSON.stringify(counts)} -> pinned ${kAfter.pins[fresh]}, expected ${leastIdx}`);
+
   r = await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ remove: 1 }) });
   j = await r.json();
   ok("a key can be removed", j.keys?.length === 1, JSON.stringify(j));
@@ -539,7 +629,72 @@ log("\nkey pool");
   ok("inbound credential used again with no pool", seen[seen.length - 1].auth === "Bearer inbound-key", seen[seen.length - 1].auth);
 }
 
+log("\nlive sessions decide placement, pins follow their key");
+{
+  const api = (b) => fetch(`${base}/keys`, { method: "POST", body: JSON.stringify(b) }).then((x) => x.json());
+  const as = (sid) => fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer inbound-key", "content-type": "application/json", "x-opencode-session-id": sid },
+    body: JSON.stringify({ model: "mock-ok", messages: [{ role: "user", content: "hi" }] }),
+  }).then((x) => x.text());
+
+  await api({ keys: ["sk-load-aaaa1111", "sk-load-bbbb2222"] });
+  // start from a clean slate: forget every session pinned by the earlier blocks
+  const before = await (await fetch(`${base}/keys`)).json();
+  for (const sid of Object.keys(before.pins)) await api({ unpin: sid });
+
+  await as("ses_live1");                                  // first live session -> key 1
+  for (const n of [1, 2, 3]) await api({ pin: { session: `ses_dead_${n}`, key: 2 } }); // pinned, never seen
+  await as("ses_new");
+  let k = await (await fetch(`${base}/keys`)).json();
+  ok("pins of sessions that never ran do not count as load", k.pins.ses_new === 2, JSON.stringify(k.pins));
+  ok("per-key session counts are live sessions only",
+    k.keys[0].sessions === 1 && k.keys[1].sessions === 1, JSON.stringify(k.keys));
+
+  const live = k.sessions.find((s) => s.id === "ses_live1");
+  ok("the session list shows who uses which key",
+    live && live.key === 1 && live.requests >= 1 && live.model === "mock-ok" && live.active === 0, JSON.stringify(live));
+  ok("sessions that never ran are not listed", !k.sessions.some((s) => s.id.startsWith("ses_dead_")));
+
+  await api({ pin: { session: "ses_remap", key: 2 } });
+  await as("ses_remap");
+  ok("pinned to key 2 uses key 2's credential", seen[seen.length - 1].auth === "Bearer sk-load-bbbb2222", seen[seen.length - 1].auth);
+  const after = await api({ remove: 1 });
+  ok("a pin follows its key when an earlier key is removed", after.pins.ses_remap === 1, JSON.stringify(after.pins));
+  await as("ses_remap");
+  ok("and the session keeps the same credential", seen[seen.length - 1].auth === "Bearer sk-load-bbbb2222", seen[seen.length - 1].auth);
+  ok("a session on the removed key loses its pin", after.pins.ses_live1 === undefined, JSON.stringify(after.pins));
+  await api({ keys: [] });
+}
+
+log("\ntok/s, ttft and cached share");
+{
+  const stream = (model) => fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model, stream: true, messages: [{ role: "user", content: "measure" }] }),
+  }).then((x) => x.text());
+  await stream("mock-tps");
+  await stream("mock-short");
+  await stream("mock-burst");
+  await sleep(200);
+
+  const u = await (await fetch(`${base}/usage`)).json();
+  const tps = u.models["24h"]["mock-tps"] || {};
+  const short = u.models["24h"]["mock-short"] || {};
+  const burst = u.models["24h"]["mock-burst"] || {};
+
+  ok("a paced stream gives a decode speed near 25 tok/s", tps.avgTps >= 12 && tps.avgTps <= 40, JSON.stringify(tps));
+  ok("median and sample count are reported", tps.tpsN >= 1 && tps.medTps > 0, JSON.stringify({ n: tps.tpsN, med: tps.medTps }));
+  ok("time to first token is recorded and excluded from the rate", tps.ttftMs >= 20 && tps.ttftMs < 500, String(tps.ttftMs));
+  ok("cached share is cached / input", tps.cachedPct === 40, String(tps.cachedPct));
+  ok("a reply under 16 tokens is left out of tok/s", short.tpsN === 0 && short.avgTps === 0, JSON.stringify({ n: short.tpsN, tps: short.avgTps }));
+  ok("a reply delivered in one frame is left out of tok/s", burst.tpsN === 0 && burst.avgTps === 0, JSON.stringify({ n: burst.tpsN, tps: burst.avgTps }));
+  ok("requests and tokens still count for the excluded replies", short.requests >= 1 && burst.output >= 24, JSON.stringify({ s: short.requests, bo: burst.output }));
+}
+
 proxy.kill();
+try { fs.unlinkSync(KEYS_FILE); } catch {}
 mock.close();
 log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

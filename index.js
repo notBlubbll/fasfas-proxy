@@ -49,6 +49,8 @@ const UPSTREAM = (() => {
 //   glm-5.3-flash      20 req/min
 //   haiku-5.5          20 req/min
 //   deepseek-v4.1-flash 40 req/min, 2,000,000 tokens/min
+// Per key, as measured on one key. The account total is these caps times the
+// number of configured keys, so a second key doubles what the panel shows.
 const LIMITS_DEFAULT =
   "sonnet-5.5=6/60s,qwen3.8-27b=20/60s,glm-5.3-flash=20/60s,haiku-5.5=20/60s,deepseek-v4.1-flash=40/60s";
 
@@ -135,6 +137,29 @@ function loadUsage() {
       } catch {}
     }
   } catch {}
+
+  // Records written before the first-token method carry a generation time that
+  // started at the first byte and ran to the end, and was divided by every output
+  // token. Those rates are wrong, so the timing is dropped (tokens, requests and
+  // cost stay). The new method always writes `sr`, which is how the two are told
+  // apart, so this runs once and then finds nothing.
+  let cleared = 0;
+  for (const r of usage.records) {
+    if (!r.seed && !("sr" in r) && r.gm) {
+      delete r.gm;
+      cleared++;
+    }
+  }
+  if (cleared > 0) {
+    for (const lt of Object.values(usage.lifetime)) if (lt) lt.genMs = 0;
+    try {
+      fs.writeFileSync(USAGE_LOG, usage.records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+      fs.writeFileSync(USAGE_FILE, JSON.stringify({ since: usage.since, lifetime: usage.lifetime }));
+    } catch (e) {
+      log(`could not rewrite usage log: ${e?.message || e}`);
+    }
+    log(`cleared the tok/s timing from ${cleared} record(s) measured by the old method`);
+  }
 }
 
 let usageSaveTimer = null;
@@ -167,10 +192,20 @@ function appendUsageRecord(rec) {
   saveUsageSoon();
 }
 
+// Stored per request:
+//   ttft - request sent -> first frame carrying model text (time to first token)
+//   gm   - first -> last text frame (the generation window). Zero when there were
+//          fewer than two text frames, which leaves the request out of tok/s.
+//   ms   - total wall time, kept for latency only.
 function recordUsage(model, result, ms) {
   if (!model || !result || result.status !== 200) return;
   const u = parseUsageFromText(result.tail);
   if (!u) return;
+  const t = result.timing || {};
+  const ttft = t.firstTokenAt && t.sentAt ? Math.max(0, t.firstTokenAt - t.sentAt) : 0;
+  const gm = t.firstTokenAt && t.lastTokenAt && t.tokenFrames >= 2
+    ? Math.max(0, t.lastTokenAt - t.firstTokenAt)
+    : 0;
   appendUsageRecord({
     t: Date.now(),
     m: model,
@@ -178,7 +213,9 @@ function recordUsage(model, result, ms) {
     o: u.completion,
     r: u.reasoning,
     c: u.cached,
-    gm: Math.max(0, Math.round(result.gm || 0)),
+    gm,
+    ttft,
+    sr: t.sawReasoning ? 1 : 0,
     ms: Math.max(0, Math.round(ms)),
   });
 }
@@ -209,9 +246,19 @@ function pruneUsage() {
   if (i > 0) usage.records.splice(0, i);
 }
 
+// Requests shorter than this are left out of tok/s: a handful of tokens over a few
+// milliseconds is dominated by network framing, not by the model's decode speed.
+const MIN_TPS_TOKENS = 16;
+const MIN_TPS_WINDOW_MS = 250;
+
 function windowStats(model, since) {
   const acc = { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, seeded: 0, cost: 0 };
-  let realOutput = 0, realGenMs = 0, realMs = 0, realReq = 0;
+  let realMs = 0, realReq = 0;
+  let realIn = 0, realCache = 0;
+  let tpsTokens = 0, tpsMs = 0, tpsN = 0;
+  let ttftSum = 0, ttftN = 0;
+  const rates = [];
+  let lastRate = 0;
   for (const r of usage.records) {
     if (r.t < since) continue;
     if (model && r.m !== model) continue;
@@ -227,13 +274,46 @@ function windowStats(model, since) {
       continue;
     }
     realReq++;
-    realOutput += r.o || 0;
-    realGenMs += r.gm || 0;
     realMs += r.ms || 0;
+    realIn += r.i || 0;
+    realCache += r.c || 0;
+
+    if (r.ttft > 0) { ttftSum += r.ttft; ttftN++; }
+
+    // Decode speed: tokens produced after the first one, over the span between
+    // the first and last text frame. Reasoning that was never streamed happened
+    // before the first frame, so it is taken out of the count.
+    if (r.gm >= MIN_TPS_WINDOW_MS) {
+      const hidden = r.r > 0 && !r.sr ? r.r : 0;
+      const n = (r.o || 0) - hidden - 1;
+      if (n >= MIN_TPS_TOKENS) {
+        tpsTokens += n;
+        tpsMs += r.gm;
+        tpsN++;
+        lastRate = n / (r.gm / 1000);
+        rates.push(lastRate);
+      }
+    }
   }
   acc.cost = +acc.cost.toFixed(6);
-  acc.avgTps = realGenMs > 0 ? +(realOutput / (realGenMs / 1000)).toFixed(1) : 0;
+  // Token-weighted: total tokens over total time, so a long answer counts for
+  // more than a short one.
+  acc.avgTps = tpsMs > 0 ? +(tpsTokens / (tpsMs / 1000)).toFixed(1) : 0;
+  // The plain mean of each request's own rate, the latest request's rate, and the
+  // median: all reported so the tooltip can show how the figure was reached.
+  acc.meanTps = rates.length ? +(rates.reduce((s, v) => s + v, 0) / rates.length).toFixed(1) : 0;
+  acc.lastTps = +lastRate.toFixed(1);
+  rates.sort((a, b) => a - b);
+  acc.medTps = rates.length ? +rates[Math.floor(rates.length / 2)].toFixed(1) : 0;
+  acc.tpsN = tpsN;
+  acc.ttftMs = ttftN > 0 ? Math.round(ttftSum / ttftN) : 0;
+  acc.ttftN = ttftN;
   acc.avgMs = realReq > 0 ? Math.round(realMs / realReq) : 0;
+  // Cached share of the prompt. Prompt tokens already include the cached ones.
+  // Imported history has no cache data, so only requests the proxy carried count.
+  acc.cachedReal = realCache;
+  acc.inputReal = realIn;
+  acc.cachedPct = realIn > 0 ? +((realCache / realIn) * 100).toFixed(1) : 0;
   return acc;
 }
 
@@ -538,9 +618,14 @@ function clearOverflowActive(target, from) {
 // ---- key pool ---------------------------------------------------------------
 // The gateway meters each key separately, so a second key means a second set of
 // per-model windows. Keys are added from the panel and stored next to the
-// plugin; an OpenCode session sticks to one key (hash of its id) so its prompt
-// cache stays warm, while session-less requests round-robin.
-const KEYS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-keys.json");
+// plugin. One session is one key: it is pinned on first sight to the key with the
+// fewest sessions, and every request it makes is charged to that key's windows
+// and no other. There is no round-robin.
+// FASFAS_PROXY_KEYS_FILE moves the file (the tests use a throwaway one).
+const KEYS_FILE = process.env.FASFAS_PROXY_KEYS_FILE ||
+  path.join(path.dirname(fileURLToPath(import.meta.url)), "keys.json");
+// The file used to be hidden; it is moved to keys.json on first start.
+const LEGACY_KEYS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-keys.json");
 const MAX_KEYS = 8;
 const CORS_HEADERS = { "cache-control": "no-store", "access-control-allow-origin": "*" };
 let keyPool = [];
@@ -548,27 +633,100 @@ let keyCursor = 0;
 // sessionId -> 1-based key slot. A session is glued to one key: its requests
 // follow that key's windows, and a second session on another key has its own.
 const sessionKeyPins = new Map();
+// A session counts toward its key's load only while it is live: seen within the
+// last half hour. Pins of sessions that stopped long ago must not push new ones
+// away from a key that is actually idle. Pins are forgotten after two weeks.
+const SESSION_LIVE_MS = 30 * 60 * 1000;
+const SESSION_PIN_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+// sessionId -> { last, active, requests, model }. `last` is persisted so a
+// restart does not make every live session look dead.
+const sessionActivity = new Map();
+
+function touchSession(sid, model) {
+  const a = sessionActivity.get(sid) || { last: 0, active: 0, requests: 0, model: null };
+  a.last = Date.now();
+  a.requests++;
+  if (model) a.model = model;
+  sessionActivity.set(sid, a);
+  saveKeysSoon();
+  return a;
+}
+
+let keysSaveTimer = null;
+function saveKeysSoon() {
+  if (keysSaveTimer) return;
+  keysSaveTimer = setTimeout(() => { keysSaveTimer = null; saveKeys(); }, 30000);
+  try { keysSaveTimer.unref?.(); } catch {}
+}
+
+// After key `removed` (1-based) is deleted, later keys shift down one slot. Pins
+// follow their key rather than their number, so a session never silently moves
+// onto a different credential; sessions that were on the removed key are
+// reassigned on their next request.
+function remapPinsAfterRemoval(removed) {
+  for (const [sid, slot] of [...sessionKeyPins]) {
+    if (slot === removed) sessionKeyPins.delete(sid);
+    else if (slot > removed) sessionKeyPins.set(sid, slot - 1);
+  }
+}
 
 function loadKeys() {
   let fromFile = [];
+  let migrate = false;
+  let source = KEYS_FILE;
+  if (!fs.existsSync(KEYS_FILE) && fs.existsSync(LEGACY_KEYS_FILE)) {
+    source = LEGACY_KEYS_FILE;
+    migrate = true;
+  }
   try {
-    const j = JSON.parse(fs.readFileSync(KEYS_FILE, "utf8"));
+    const j = JSON.parse(fs.readFileSync(source, "utf8"));
     if (Array.isArray(j.keys)) fromFile = j.keys;
     if (j && typeof j.pins === "object" && j.pins) {
       for (const [sid, slot] of Object.entries(j.pins)) {
         if (typeof sid === "string" && Number.isInteger(slot)) sessionKeyPins.set(sid, slot);
       }
     }
+    if (j && typeof j.seen === "object" && j.seen) {
+      for (const [sid, ts] of Object.entries(j.seen)) {
+        if (Number.isFinite(ts)) sessionActivity.set(sid, { last: ts, active: 0, requests: 0, model: null });
+      }
+    }
   } catch {}
+  {
+    const now = Date.now();
+    for (const sid of [...sessionKeyPins.keys()]) {
+      const a = sessionActivity.get(sid);
+      if (!a) {
+        // pinned by an older file with no timestamp: keep it, but not as live
+        sessionActivity.set(sid, { last: now - SESSION_LIVE_MS - 1, active: 0, requests: 0, model: null });
+      } else if (now - a.last > SESSION_PIN_TTL_MS) {
+        sessionKeyPins.delete(sid);
+        sessionActivity.delete(sid);
+      }
+    }
+  }
   const fromEnv = String(process.env.FASFAS_PROXY_KEYS || "").split(",");
   keyPool = [...new Set([...fromEnv, ...fromFile].map((k) => String(k || "").trim()).filter(Boolean))].slice(0, MAX_KEYS);
+
+  if (migrate) {
+    saveKeys();
+    if (fs.existsSync(KEYS_FILE)) {
+      try { fs.unlinkSync(LEGACY_KEYS_FILE); } catch {}
+      log(`moved ${path.basename(LEGACY_KEYS_FILE)} -> ${path.basename(KEYS_FILE)} (${keyPool.length} key(s) kept)`);
+    }
+  }
 }
 
 function saveKeys() {
   try {
     const pins = {};
-    for (const [sid, slot] of sessionKeyPins) pins[sid] = slot;
-    fs.writeFileSync(KEYS_FILE, JSON.stringify({ keys: keyPool, pins }, null, 2) + "\n", "utf8");
+    const seen = {};
+    for (const [sid, slot] of sessionKeyPins) {
+      pins[sid] = slot;
+      const a = sessionActivity.get(sid);
+      if (a && a.last) seen[sid] = a.last;
+    }
+    fs.writeFileSync(KEYS_FILE, JSON.stringify({ keys: keyPool, pins, seen }, null, 2) + "\n", "utf8");
     try { fs.chmodSync(KEYS_FILE, 0o600); } catch {}
   } catch (e) {
     log(`could not save keys: ${e?.message || e}`);
@@ -589,14 +747,23 @@ function keySlotForSession(sessionId) {
   const pinned = sessionKeyPins.get(sessionId);
   if (Number.isInteger(pinned) && pinned >= 1 && pinned <= keyPool.length) return pinned;
 
-  const counts = new Array(keyPool.length).fill(0);
-  for (const slot of sessionKeyPins.values()) {
-    if (Number.isInteger(slot) && slot >= 1 && slot <= keyPool.length) counts[slot - 1]++;
-  }
+  // Only live sessions count: one that stopped hours ago is not load.
+  const counts = liveSessionCounts();
   const slot = counts.indexOf(Math.min(...counts)) + 1;
   sessionKeyPins.set(sessionId, slot);
   saveKeys();
   return slot;
+}
+
+function liveSessionCounts() {
+  const counts = new Array(keyPool.length).fill(0);
+  const now = Date.now();
+  for (const [sid, slot] of sessionKeyPins) {
+    const a = sessionActivity.get(sid);
+    if (!a || now - a.last > SESSION_LIVE_MS) continue;
+    if (Number.isInteger(slot) && slot >= 1 && slot <= keyPool.length) counts[slot - 1]++;
+  }
+  return counts;
 }
 
 function pickKey(sessionId) {
@@ -606,14 +773,31 @@ function pickKey(sessionId) {
 }
 
 function keysReport() {
+  const now = Date.now();
   const pins = {};
   for (const [sid, slot] of sessionKeyPins) pins[sid] = slot;
+  const live = liveSessionCounts();
+
+  // Sessions seen recently, with the key each one is glued to. Active ones
+  // (a request in flight) first, then most recently used.
+  const sessions = [];
+  for (const [id, a] of sessionActivity) {
+    if (now - a.last > SESSION_LIVE_MS) continue;
+    sessions.push({
+      id,
+      key: sessionKeyPins.get(id) || 0,
+      active: a.active,
+      requests: a.requests,
+      model: a.model,
+      idleMs: Math.max(0, now - a.last),
+    });
+  }
+  sessions.sort((x, y) => (y.active > 0) - (x.active > 0) || x.idleMs - y.idleMs);
+
   return {
-    keys: keyPool.map((k, i) => {
-      const pinned = [...sessionKeyPins.values()].filter((s) => s === i + 1).length;
-      return { index: i + 1, hint: maskKey(k), sessions: pinned };
-    }),
+    keys: keyPool.map((k, i) => ({ index: i + 1, hint: maskKey(k), sessions: live[i] || 0 })),
     pins,
+    sessions,
     max: MAX_KEYS,
     file: KEYS_FILE,
   };
@@ -634,13 +818,16 @@ async function pingModel(model, auth) {
   // Include the reply budget so the token reservation cannot push a window over
   // its cap: the limiter sees prompt + max_tokens up front.
   const estTokens = Math.ceil((PING_PROMPT.length + 64) / 4) + 60;
-  const lim = limiterFor(model);
+  // A ping is not a session, so it runs on key 1 and never touches a pinned
+  // session's windows on another key.
+  const pingSlot = keyPool.length ? 1 : 0;
+  const lim = limiterFor(model, pingSlot);
   let reservation = null;
   let queueMs = 0;
 
   if (lim) {
     PROXY_STATE.queued++;
-    try { reservation = await acquire(model, estTokens, PING_MAX_WAIT_MS); } finally { PROXY_STATE.queued--; }
+    try { reservation = await acquire(model, estTokens, PING_MAX_WAIT_MS, pingSlot); } finally { PROXY_STATE.queued--; }
     queueMs = Date.now() - started;
     if (reservation && reservation.spill) {
       const waitMs = lim.waitTime(Date.now(), estTokens);
@@ -658,7 +845,9 @@ async function pingModel(model, auth) {
     const j = JSON.parse(res.text);
     const text = (j?.choices?.[0]?.message?.content || "").trim();
     const u = parseUsageFromText(res.text);
-    if (u) appendUsageRecord({ t: Date.now(), m: model, i: u.prompt, o: u.completion, r: u.reasoning, c: u.cached, gm: Math.max(0, ms - queueMs), ms });
+    // A non-streaming reply has no first-token time, so it carries no gm/ttft and
+    // stays out of tok/s; it still counts toward requests and tokens.
+    if (u) appendUsageRecord({ t: Date.now(), m: model, i: u.prompt, o: u.completion, r: u.reasoning, c: u.cached, ms: Math.max(0, ms - queueMs) });
     reconcileTokens(reservation, estTokens, Buffer.byteLength(res.text));
     return { model, ok: true, queueMs, ms, text };
   } catch (e) {
@@ -776,7 +965,7 @@ function targetMatches(model) {
 }
 
 // One non-streaming vision call against the same upstream and credentials.
-async function analyzeImage({ auth, url }) {
+async function analyzeImage({ auth, url, slot = 0 }) {
   const payload = {
     model: VISION_MODEL,
     stream: false,
@@ -793,7 +982,7 @@ async function analyzeImage({ auth, url }) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      await acquire(VISION_MODEL);
+      await acquire(VISION_MODEL, 0, 0, slot);
       const res = await postJson("/chat/completions", headers, payload);
       if (res.status >= 400) {
         lastErr = new Error(`vision status ${res.status}: ${res.text.slice(0, 200)}`);
@@ -817,7 +1006,7 @@ async function analyzeImage({ auth, url }) {
 
 // Replace every image part in `rawBody` with its caption. Returns the original
 // buffer untouched when the model is not a configured target.
-async function visionHandoff(rawBody, model, auth, force = false) {
+async function visionHandoff(rawBody, model, auth, force = false, slot = 0) {
   if (!VISION_ENABLED || !model || model === VISION_MODEL) return rawBody;
   if (!force && !targetMatches(model)) return rawBody;
 
@@ -835,7 +1024,7 @@ async function visionHandoff(rawBody, model, auth, force = false) {
       cached++;
     } else {
       try {
-        desc = await analyzeImage({ auth, url: img.url });
+        desc = await analyzeImage({ auth, url: img.url, slot });
         visionCacheSet(key, desc);
         analyzed++;
       } catch (e) {
@@ -966,7 +1155,7 @@ function parseRetryAfterMs(headers) {
 const LIMIT_RE = /\((\d+)\s+requests?\s+per\s+(minute|hour)\)/i;
 const RETRY_HINT_RE = /try again in\s+(\d+)\s*(s|sec|ms)/i;
 
-function learnFrom429(model, headers, text) {
+function learnFrom429(model, headers, text, slot = 0) {
   let retryMs = parseRetryAfterMs(headers);
   let discovered = null;
 
@@ -981,11 +1170,13 @@ function learnFrom429(model, headers, text) {
   if (retryMs == null) retryMs = 15000;
   retryMs = Math.min(retryMs, RETRY_AFTER_CAP_MS);
 
-  let lim = limiterFor(model);
+  // Only the session's own key slot is blocked: a 429 on key 1 must not stall
+  // a session pinned to key 2.
+  let lim = limiterFor(model, slot);
   if (discovered) {
     if (!lim) {
       lim = new ModelLimiter(model, discovered.max, discovered.windowMs);
-      limiters.set(model, lim);
+      limiters.set(slot ? `${slot}|${model}` : model, lim);
     } else if (lim.max !== discovered.max || lim.windowMs !== discovered.windowMs) {
       log(`learned ${model} limit from upstream: ${discovered.max}/${discovered.windowMs / 1000}s`);
       lim.max = discovered.max;
@@ -1032,6 +1223,23 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/healthz") {
     return send(res, 200, "text/plain", "fasfas-proxy OK\n");
   }
+  if (req.method === "GET" && url.pathname === "/keys/reveal") {
+    // The only route that returns a full key. It answers one key per request,
+    // only to loopback, and refuses browser pages (http/https origins), so a web
+    // page open in a browser cannot read a key from here.
+    const origin = req.headers.origin || "";
+    const ra = req.socket.remoteAddress || "";
+    if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(ra) || /^https?:\/\//i.test(origin)) {
+      return sendJson(res, 403, JSON.stringify({ error: "not available to this origin" }));
+    }
+    const slot = Number(url.searchParams.get("slot"));
+    if (!Number.isInteger(slot) || slot < 1 || slot > keyPool.length) {
+      return sendJson(res, 404, JSON.stringify({ error: "no such key" }));
+    }
+    return send(res, 200, "application/json", JSON.stringify({ slot, key: keyPool[slot - 1] }) + "\n",
+      { "cache-control": "no-store", "access-control-allow-origin": origin || "null" });
+  }
+
   if (url.pathname === "/keys") {
     if (req.method === "GET") {
       return send(res, 200, "application/json", JSON.stringify(keysReport(), null, 2) + "\n", CORS_HEADERS);
@@ -1067,7 +1275,10 @@ async function handle(req, res) {
         if (keyPool.length >= MAX_KEYS) return sendJson(res, 409, JSON.stringify({ error: `at most ${MAX_KEYS} keys` }));
         keyPool.push(k);
       } else if (Number.isInteger(body.remove) && body.remove >= 1) {
-        keyPool.splice(body.remove - 1, 1);
+        if (body.remove <= keyPool.length) {
+          keyPool.splice(body.remove - 1, 1);
+          remapPinsAfterRemoval(body.remove);
+        }
       } else {
         return sendJson(res, 400, JSON.stringify({ error: 'send {"keys":[...]}, {"add":"<key>"} or {"remove":<index>}' }));
       }
@@ -1106,22 +1317,28 @@ async function handle(req, res) {
   }
   if (req.method === "GET" && url.pathname === "/status") {
     const now = Date.now();
-    // One model can have a limiter per key slot; the panel wants the capacity
-    // the account has overall, so the numbers are summed.
+    // Each key slot has its own windows at the gateway's real per-key cap. The
+    // account total is that cap times the number of keys: usage is summed across
+    // slots, the cap is not. One key reports 6, two keys report 12.
+    const accountKeys = Math.max(1, keyPool.length);
     const models = {};
     for (const lim of limiters.values()) {
       const snap = lim.snapshot(now);
       const cur = models[lim.model];
-      if (!cur) { models[lim.model] = snap; continue; }
+      if (!cur) { models[lim.model] = { ...snap }; continue; }
       cur.used += snap.used;
-      cur.max += snap.max;
       cur.tokensUsed += snap.tokensUsed;
-      cur.tokenMax += snap.tokenMax;
       cur.total += snap.total;
       cur.throttled += snap.throttled;
       cur.retries += snap.retries;
       cur.shed += snap.shed;
       cur.blockedMs = Math.max(cur.blockedMs, snap.blockedMs);
+    }
+    for (const [name, m] of Object.entries(models)) {
+      const cfg = LIMITS.get(name) || LIMIT_FALLBACK;
+      const tok = TOKEN_LIMITS.get(name) || TOKEN_FALLBACK;
+      m.max = cfg ? cfg.max * accountKeys : 0;
+      m.tokenMax = tok ? tok.max * accountKeys : 0;
     }
     return send(res, 200, "application/json", JSON.stringify({
       proxy: "fasfas-proxy",
@@ -1150,10 +1367,12 @@ async function handle(req, res) {
         minPromptChars: COMPACTION_MIN_CHARS,
         handoffs: PROXY_STATE.compactionHandoffs || 0,
       },
+      keys: accountKeys,
+      // Account totals: the per-key caps times the configured key count.
       limits: Object.fromEntries(
-        [...LIMITS].filter(([k]) => k !== "*").map(([k, v]) => [k, `${v.max}/${v.windowMs / 1000}s`])),
+        [...LIMITS].filter(([k]) => k !== "*").map(([k, v]) => [k, `${v.max * accountKeys}/${v.windowMs / 1000}s`])),
       tokenLimits: Object.fromEntries(
-        [...TOKEN_LIMITS].filter(([k]) => k !== "*").map(([k, v]) => [k, `${v.max}/${v.windowMs / 1000}s`])),
+        [...TOKEN_LIMITS].filter(([k]) => k !== "*").map(([k, v]) => [k, `${v.max * accountKeys}/${v.windowMs / 1000}s`])),
       models,
       updated: now,
     }, null, 2) + "\n", { "cache-control": "no-store", "access-control-allow-origin": "*" });
@@ -1177,10 +1396,13 @@ async function handle(req, res) {
   PROXY_STATE.requests++;
   PROXY_STATE.active++;
   let spill = null; // { target, from } while this request is served by a fallback
+  // Mark the session live, with a request in flight, for the panel's session list.
+  const sessionAct = sessionId ? touchSession(sessionId, model) : null;
+  if (sessionAct) sessionAct.active++;
   try {
     if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
     if (isChat && model) {
-      body = await visionHandoff(body, model, req.headers.authorization);
+      body = await visionHandoff(body, model, req.headers.authorization, false, keySlot);
       const after = readRequest(body);
       if (after.model) meta = after;
       model = after.model || model;
@@ -1191,7 +1413,7 @@ async function handle(req, res) {
     // fallback model if the provider blocks the summary.
     if (isChat && model && looksLikeCompaction(meta)) {
       await deferWhileBusy(model);
-      const finished = await runCompaction(req, res, url, body, model);
+      const finished = await runCompaction(req, res, url, body, model, keySlot);
       if (finished) return;
       meta = readRequest(body);
       model = meta.model || model;
@@ -1217,14 +1439,14 @@ async function handle(req, res) {
       spill = { target: rule.to, from };
       markOverflowActive(rule.to, from);
       reservation = null;
-      if (limiterFor(model)) {
+      if (limiterFor(model, keySlot)) {
         PROXY_STATE.queued++;
-        try { reservation = await acquire(model, estTokens); } finally { PROXY_STATE.queued--; }
+        try { reservation = await acquire(model, estTokens, 0, keySlot); } finally { PROXY_STATE.queued--; }
       }
       return true;
     };
 
-    if (isChat && model && limiterFor(model)) {
+    if (isChat && model && limiterFor(model, keySlot)) {
       const rule = OVERFLOW.get(model);
       const queuedAt = Date.now();
       PROXY_STATE.queued++;
@@ -1259,7 +1481,7 @@ async function handle(req, res) {
       if (result.visionFallback) {
         imageFallback = false;
         log(`upstream rejected an image request for ${model} (400); retrying with captions :: ${String(result.text).replace(/\s+/g, " ").slice(0, 160)}`);
-        body = await visionHandoff(body, model, req.headers.authorization, true);
+        body = await visionHandoff(body, model, req.headers.authorization, true, keySlot);
         continue;
       }
       if (result.serverError) {
@@ -1282,7 +1504,7 @@ async function handle(req, res) {
         log(`429 budget exhausted for ${model}, forwarding the 429`);
         return sendJson(res, result.status, result.text);
       }
-      const { retryMs } = learnFrom429(model, result.headers, result.text);
+      const { retryMs } = learnFrom429(model, result.headers, result.text, keySlot);
       PROXY_STATE.retries++;
       const rule = OVERFLOW.get(model);
       if (rule && !spilledFrom && retryMs > rule.maxWaitMs) {
@@ -1294,6 +1516,7 @@ async function handle(req, res) {
     }
   } finally {
     if (spill) clearOverflowActive(spill.target, spill.from);
+    if (sessionAct) sessionAct.active = Math.max(0, sessionAct.active - 1);
     clearSessionRetry(sessionId);
     PROXY_STATE.active--;
     log(`done ${url.pathname} model=${model || "-"} in ${Date.now() - started}ms`);
@@ -1309,6 +1532,14 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
     let settled = false;
     let respBytes = 0;
     let firstByteAt = 0;
+    // Timing for tok/s. The clock starts at the first frame that carries model
+    // text, not the first byte: SSE keep-alives and role-only frames are not
+    // generation, and counting them makes slow starts look like slow decoding.
+    let firstTokenAt = 0;
+    let lastTokenAt = 0;
+    let tokenFrames = 0;
+    let sawReasoning = false;
+    const sentAt = Date.now();
     let tail = "";
     const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
 
@@ -1333,7 +1564,18 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       upRes.on("data", (c) => {
         respBytes += c.length;
         if (!firstByteAt) firstByteAt = Date.now();
-        if (status === 200) tail = (tail + c.toString("utf8")).slice(-8192);
+        if (status === 200) {
+          const text = c.toString("utf8");
+          tail = (tail + text).slice(-8192);
+          // A frame counts as generation when it carries content or reasoning.
+          if (/"(content|reasoning|reasoning_content|text)"\s*:\s*"[^"]/.test(text)) {
+            const now = Date.now();
+            if (!firstTokenAt) firstTokenAt = now;
+            lastTokenAt = now;
+            tokenFrames++;
+            if (/"(reasoning|reasoning_content)"\s*:\s*"[^"]/.test(text)) sawReasoning = true;
+          }
+        }
       });
       const hdrs = { ...upRes.headers, ...(opts.headers || {}) };
       delete hdrs["transfer-encoding"];
@@ -1373,8 +1615,9 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       log(`res ${status} model=${model || "-"} ct=${hdrs["content-type"] || "-"}`);
       res.writeHead(status, hdrs);
       upRes.pipe(res);
-      upRes.on("end", () => finish({ done: true, status, bytes: respBytes, tail, gm: firstByteAt ? Date.now() - firstByteAt : 0 }));
-      upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, gm: firstByteAt ? Date.now() - firstByteAt : 0 }); });
+      const timing = () => ({ sentAt, firstTokenAt, lastTokenAt, tokenFrames, sawReasoning });
+      upRes.on("end", () => finish({ done: true, status, bytes: respBytes, tail, timing: timing() }));
+      upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, timing: timing() }); });
     });
 
     res.on("close", () => {
@@ -1500,12 +1743,12 @@ function writeBuffered(res, r) {
 // Runs one compaction request: quiet window, then the original model, then the
 // handoff model if the provider blocked it. Returns true when the client has
 // been answered.
-async function runCompaction(req, res, url, body, model) {
+async function runCompaction(req, res, url, body, model, slot = 0) {
   const estTokens = estimateTokens(body);
   let reservation = null;
-  if (limiterFor(model)) {
+  if (limiterFor(model, slot)) {
     PROXY_STATE.queued++;
-    try { reservation = await acquire(model, estTokens); } finally { PROXY_STATE.queued--; }
+    try { reservation = await acquire(model, estTokens, 0, slot); } finally { PROXY_STATE.queued--; }
   }
   const settle = (r) => reconcileTokens(reservation, estTokens, usageTokens(r.text) || r.text.length);
 
@@ -1514,9 +1757,9 @@ async function runCompaction(req, res, url, body, model) {
     const r = await forwardBuffered(req, url, body, model);
 
     if (r.status === 429) {
-      const { retryMs } = learnFrom429(model, r.headers, r.text);
+      const { retryMs } = learnFrom429(model, r.headers, r.text, slot);
       PROXY_STATE.retries++;
-      log(`upstream 429 for ${model} (compaction); waiting ${Math.round(retryMs / 1000)}s (attempt ${attempt})`);
+      log(`upstream 429 for ${model} (compaction, key ${slot || "-"}); waiting ${Math.round(retryMs / 1000)}s (attempt ${attempt})`);
       if (Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
         writeBuffered(res, r);
         return true;
@@ -1537,7 +1780,7 @@ async function runCompaction(req, res, url, body, model) {
     PROXY_STATE.compactionHandoffs = (PROXY_STATE.compactionHandoffs || 0) + 1;
     const handoffBody = rewriteModel(body, COMPACTION_MODEL);
     let handoffReservation = null;
-    if (limiterFor(COMPACTION_MODEL)) handoffReservation = await acquire(COMPACTION_MODEL, estimateTokens(handoffBody));
+    if (limiterFor(COMPACTION_MODEL, slot)) handoffReservation = await acquire(COMPACTION_MODEL, estimateTokens(handoffBody), 0, slot);
     const r2 = await forwardBuffered(req, url, handoffBody, COMPACTION_MODEL);
     reconcileTokens(handoffReservation, estimateTokens(handoffBody), usageTokens(r2.text) || r2.text.length);
     log(`compaction handoff model=${COMPACTION_MODEL} status=${r2.status} finish=${r2.finish || "-"} bytes=${r2.text.length}`);

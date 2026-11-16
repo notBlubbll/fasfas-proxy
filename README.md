@@ -38,6 +38,11 @@ on a different model instead of killing the turn.
 | `sonnet-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 6 | 1,000,000 |
 | `qwen3.8-27b` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 3,000,000 |
 
+> The limits are **per key**: the gateway's real caps, as shown on each key's
+> dashboard. The account total is the per-key cap × the number of configured
+> keys, so two keys double what `/status` and the panel report. One key shows the
+> original numbers.
+
 - All five speak tools, streaming and `reasoning_effort`, and expose the variants
   `low` / `medium` / `high` / `xhigh` / `max`.
 - **The limits are per model, not shared.** The aggregate ceiling is 106 req/min
@@ -46,8 +51,9 @@ on a different model instead of killing the turn.
 - **Images are passed through untouched.** All five models see images natively
   (verified: haiku and sonnet name all four quadrants of a 64×64 image), so the
   proxy only captions an image when the upstream actually rejects it.
-- `sonnet-5.5` is the scarce one at 6 requests/minute. Point subagents at
-  `deepseek-v4.1-flash` (40/min) rather than letting a fan-out eat sonnet's budget.
+- `sonnet-5.5` is the scarcest at 6 requests/minute per key (12 with two keys).
+  Point subagents at `deepseek-v4.1-flash` (40/min per key) rather than letting a
+  fan-out eat sonnet's budget.
 
 > **Costs** in `/usage` and the panel are estimates using OpenCode's published
 > token rates. They are not what this gateway bills (it currently bills nothing).
