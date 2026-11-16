@@ -62,11 +62,6 @@ usage table, with no request or token limits on the gateway:
 - **Images are passed through untouched.** The other chat models see images natively
   (verified: haiku and sonnet name all four quadrants of a 64×64 image), so the
   proxy only captions an image when the upstream actually rejects it.
-- **Retired models.** `qwen3.8-27b` was removed because the gateway no longer
-  lists it (404). Its limits and config entry are gone from this repo, and in the
-  live config it is `disabled: true`; `git log` has the entry if it returns. Its
-  past requests keep their cost in the usage history. `gemini-4hy` was added as a
-  preview and removed the same way.
 - `glm-5.2` is text only: an image request gets `404 No endpoints found that
   support image input` from the gateway. For code it passed a check: it wrote a
   `parseDuration` function that passed 11 of 11 test cases in about 2s, and it
@@ -79,6 +74,26 @@ usage table, with no request or token limits on the gateway:
 > token rates. They are not what this gateway bills (it currently bills nothing).
 
 Everything in the table is overridable by the env vars below.
+
+### Deprecated models
+
+Models the gateway no longer serves. They are not offered, limited or listed in
+the panel, and they are not in `opencode.fasfas.json`. Each one's last known
+settings are here, so bringing it back is a copy-paste (`git log` also has the old
+config entry).
+
+| Model | Context | Output | Image | Req/min | Tok/min | Status | Retired | Why |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `qwen3.8-27b` | 1,000,000 | 65,536 | ✅ native | 20 | 3,000,000 | removed | 2026-11-16 | gone from `/v1/models`; calls return `404` |
+| `gemini-4hy` (Gemini 4 Hydrogen) | 1,000,000 | 65,536 | not tested | 20 | 3,000,000 | removed | 2026-11-16 | listed briefly; upstream rejected every call (ZDR policy), then it left `/v1/models` |
+
+- In the live OpenCode config a retired model can be kept as `disabled: true`
+  instead of deleting it. `qwen3.8-27b` is set that way on the author's machine.
+- Requests a retired model already served stay in the usage history with their
+  cost (the proxy keeps their price internally), but the panel shows no row for it.
+- To restore one: add its limits to `FASFAS_PROXY_LIMITS` / `FASFAS_PROXY_TOKEN_LIMITS`
+  and its rates to `PRICING_DEFAULT` in `index.js`, then re-add the model to the
+  provider config.
 
 ### How the limits were measured
 

@@ -757,8 +757,14 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     const body = document.createElement("tbody");
     // Every model the proxy knows a price for gets a row, so a model that has not
     // been used in this window still shows up (with zeros) instead of being absent.
-    const models = Object.assign({}, (data.models && data.models[win]) || {});
-    for (const name of Object.keys(data.pricing || {})) {
+    // Only models the proxy still offers get a row. A retired model (one the
+    // gateway no longer lists) has no price entry, so its history is not shown here.
+    const offered = data.pricing ? new Set(Object.keys(data.pricing)) : null;
+    const models = {};
+    for (const [name, m] of Object.entries((data.models && data.models[win]) || {})) {
+      if (!offered || offered.has(name)) models[name] = m;
+    }
+    for (const name of offered || []) {
       if (!models[name]) models[name] = { requests: 0, input: 0, output: 0, reasoning: 0, cost: 0 };
     }
     const rows = Object.entries(models).sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0) || (b[1].output || 0) - (a[1].output || 0));
