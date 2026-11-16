@@ -4,3 +4,4 @@ node_modules/
 .DS_Store
 .fasfas-usage.json
 .fasfas-usage.jsonl
+.fasfas-keys.json

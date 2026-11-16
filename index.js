@@ -415,9 +415,11 @@ class ModelLimiter {
 
 const limiters = new Map();
 
-function limiterFor(model) {
+function limiterFor(model, slot = 0) {
   if (!model) return null;
-  let lim = limiters.get(model);
+  // Each key has its own per-model windows, so the limiter is keyed by both.
+  const mapKey = slot ? `${slot}|${model}` : model;
+  let lim = limiters.get(mapKey);
   if (lim) return lim;
   const cfg = LIMITS.get(model) || LIMIT_FALLBACK;
   const tok = TOKEN_LIMITS.get(model) || TOKEN_FALLBACK;
@@ -431,7 +433,7 @@ function limiterFor(model) {
     tokenMax,
     tok ? tok.windowMs : 60000,
   );
-  limiters.set(model, lim);
+  limiters.set(mapKey, lim);
   return lim;
 }
 
@@ -441,8 +443,8 @@ function limiterFor(model) {
 // With `maxWaitMs`, a caller gives up its place instead of waiting longer than
 // that and resolves `{ spill: true }` without reserving anything, so the caller
 // can send the request somewhere else (see the overflow rules below).
-function acquire(model, estTokens = 0, maxWaitMs = 0) {
-  const lim = limiterFor(model);
+function acquire(model, estTokens = 0, maxWaitMs = 0, slot = 0) {
+  const lim = limiterFor(model, slot);
   if (!lim) return Promise.resolve(null);
   const calledAt = Date.now();
   let cancelled = false;
@@ -543,12 +545,20 @@ const MAX_KEYS = 8;
 const CORS_HEADERS = { "cache-control": "no-store", "access-control-allow-origin": "*" };
 let keyPool = [];
 let keyCursor = 0;
+// sessionId -> 1-based key slot. A session is glued to one key: its requests
+// follow that key's windows, and a second session on another key has its own.
+const sessionKeyPins = new Map();
 
 function loadKeys() {
   let fromFile = [];
   try {
     const j = JSON.parse(fs.readFileSync(KEYS_FILE, "utf8"));
     if (Array.isArray(j.keys)) fromFile = j.keys;
+    if (j && typeof j.pins === "object" && j.pins) {
+      for (const [sid, slot] of Object.entries(j.pins)) {
+        if (typeof sid === "string" && Number.isInteger(slot)) sessionKeyPins.set(sid, slot);
+      }
+    }
   } catch {}
   const fromEnv = String(process.env.FASFAS_PROXY_KEYS || "").split(",");
   keyPool = [...new Set([...fromEnv, ...fromFile].map((k) => String(k || "").trim()).filter(Boolean))].slice(0, MAX_KEYS);
@@ -556,7 +566,9 @@ function loadKeys() {
 
 function saveKeys() {
   try {
-    fs.writeFileSync(KEYS_FILE, JSON.stringify({ keys: keyPool }, null, 2) + "\n", "utf8");
+    const pins = {};
+    for (const [sid, slot] of sessionKeyPins) pins[sid] = slot;
+    fs.writeFileSync(KEYS_FILE, JSON.stringify({ keys: keyPool, pins }, null, 2) + "\n", "utf8");
     try { fs.chmodSync(KEYS_FILE, 0o600); } catch {}
   } catch (e) {
     log(`could not save keys: ${e?.message || e}`);
@@ -568,26 +580,42 @@ function maskKey(k) {
   return s.length <= 4 ? "…" : "…" + s.slice(-4);
 }
 
-// Sticky per session, round-robin otherwise. Returns null when no pool is set,
-// which leaves the inbound credential untouched.
-function pickKey(sessionId) {
-  if (keyPool.length === 0) return null;
-  if (sessionId) {
-    let h = 0;
-    for (let i = 0; i < sessionId.length; i++) h = (h * 31 + sessionId.charCodeAt(i)) >>> 0;
-    return keyPool[h % keyPool.length];
+// Which key slot a session uses: an explicit pin, or the least-pinned slot,
+// which is then remembered so the session stays on it for good.
+function keySlotForSession(sessionId) {
+  if (keyPool.length === 0) return 0;
+  if (!sessionId) return 1;
+
+  const pinned = sessionKeyPins.get(sessionId);
+  if (Number.isInteger(pinned) && pinned >= 1 && pinned <= keyPool.length) return pinned;
+
+  const counts = new Array(keyPool.length).fill(0);
+  for (const slot of sessionKeyPins.values()) {
+    if (Number.isInteger(slot) && slot >= 1 && slot <= keyPool.length) counts[slot - 1]++;
   }
-  const key = keyPool[keyCursor % keyPool.length];
-  keyCursor = (keyCursor + 1) % keyPool.length;
-  return key;
+  const slot = counts.indexOf(Math.min(...counts)) + 1;
+  sessionKeyPins.set(sessionId, slot);
+  saveKeys();
+  return slot;
+}
+
+function pickKey(sessionId) {
+  const slot = keySlotForSession(sessionId);
+  if (slot >= 1 && slot <= keyPool.length) return keyPool[slot - 1];
+  return keyPool[0] || null;
 }
 
 function keysReport() {
+  const pins = {};
+  for (const [sid, slot] of sessionKeyPins) pins[sid] = slot;
   return {
-    keys: keyPool.map((k, i) => ({ index: i + 1, hint: maskKey(k) })),
+    keys: keyPool.map((k, i) => {
+      const pinned = [...sessionKeyPins.values()].filter((s) => s === i + 1).length;
+      return { index: i + 1, hint: maskKey(k), sessions: pinned };
+    }),
+    pins,
     max: MAX_KEYS,
     file: KEYS_FILE,
-    header: "Authorization: Bearer <key>",
   };
 }
 
@@ -1015,8 +1043,26 @@ async function handle(req, res) {
 
       if (Array.isArray(body.keys)) {
         keyPool = [...new Set(body.keys.map((k) => String(k).trim()).filter(Boolean))].slice(0, MAX_KEYS);
-      } else if (typeof body.add === "string" && body.add.trim()) {
-        const k = body.add.trim();
+      } else if (Number.isInteger(body.set) && typeof body.key === "string" && body.key.trim()) {
+        // Address one slot directly, which is what the panel's Key 1 / Key 2
+        // fields use.
+        const n = body.set;
+        if (n < 1 || n > MAX_KEYS) return sendJson(res, 400, JSON.stringify({ error: `slot must be 1..${MAX_KEYS}` }));
+        const k = body.key.trim();
+        while (keyPool.length < n) keyPool.push("");
+        keyPool[n - 1] = k;
+        keyPool = keyPool.filter(Boolean).slice(0, MAX_KEYS);
+      } else if (body.pin && typeof body.pin.session === "string" && Number.isInteger(body.pin.key)) {
+        const slot = body.pin.key;
+        if (slot < 1 || slot > keyPool.length) {
+          return sendJson(res, 400, JSON.stringify({ error: `no key ${slot}; ${keyPool.length} configured` }));
+        }
+        sessionKeyPins.set(body.pin.session, slot);
+        log(`pinned session ${body.pin.session} to key ${slot}`);
+      } else if (typeof body.unpin === "string") {
+        sessionKeyPins.delete(body.unpin);
+        log(`unpinned session ${body.unpin}`);
+      } else if (typeof body.add === "string" && body.add.trim()) {        const k = body.add.trim();
         if (keyPool.includes(k)) return sendJson(res, 409, JSON.stringify({ error: "key already configured" }));
         if (keyPool.length >= MAX_KEYS) return sendJson(res, 409, JSON.stringify({ error: `at most ${MAX_KEYS} keys` }));
         keyPool.push(k);
@@ -1060,8 +1106,23 @@ async function handle(req, res) {
   }
   if (req.method === "GET" && url.pathname === "/status") {
     const now = Date.now();
+    // One model can have a limiter per key slot; the panel wants the capacity
+    // the account has overall, so the numbers are summed.
     const models = {};
-    for (const lim of limiters.values()) models[lim.model] = lim.snapshot(now);
+    for (const lim of limiters.values()) {
+      const snap = lim.snapshot(now);
+      const cur = models[lim.model];
+      if (!cur) { models[lim.model] = snap; continue; }
+      cur.used += snap.used;
+      cur.max += snap.max;
+      cur.tokensUsed += snap.tokensUsed;
+      cur.tokenMax += snap.tokenMax;
+      cur.total += snap.total;
+      cur.throttled += snap.throttled;
+      cur.retries += snap.retries;
+      cur.shed += snap.shed;
+      cur.blockedMs = Math.max(cur.blockedMs, snap.blockedMs);
+    }
     return send(res, 200, "application/json", JSON.stringify({
       proxy: "fasfas-proxy",
       upstream: UPSTREAM.href,
@@ -1104,12 +1165,14 @@ async function handle(req, res) {
   const isChat = url.pathname.includes("/chat/completions");
   const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"] || null;
   // With a key pool configured, this request goes out on the key its session is
-  // pinned to, instead of whatever credential OpenCode sent.
-  const pooledAuth = pickKey(sessionId);
-  if (pooledAuth) req.headers.authorization = `Bearer ${pooledAuth}`;
+  // pinned to, and follows that key's windows rather than the shared ones.
+  const keySlot = keySlotForSession(sessionId);
+  if (keySlot >= 1 && keySlot <= keyPool.length) {
+    req.headers.authorization = `Bearer ${keyPool[keySlot - 1]}`;
+  }
   const started = Date.now();
 
-  log(`req ${req.method} ${url.pathname} model=${model || "-"} stream=${meta.stream} bytes=${body.length} max_tokens=${meta.maxTokens ?? "default"}`);
+  log(`req ${req.method} ${url.pathname} model=${model || "-"} stream=${meta.stream} bytes=${body.length} max_tokens=${meta.maxTokens ?? "default"} key=${keySlot || "-"}`);
 
   PROXY_STATE.requests++;
   PROXY_STATE.active++;
@@ -1165,7 +1228,7 @@ async function handle(req, res) {
       const rule = OVERFLOW.get(model);
       const queuedAt = Date.now();
       PROXY_STATE.queued++;
-      try { reservation = await acquire(model, estTokens, rule ? rule.maxWaitMs : 0); } finally { PROXY_STATE.queued--; }
+      try { reservation = await acquire(model, estTokens, rule ? rule.maxWaitMs : 0, keySlot); } finally { PROXY_STATE.queued--; }
       if (reservation && reservation.spill) {
         await spillOver(`a slot would take over ${rule.maxWaitMs / 1000}s`);
       } else {

@@ -76,7 +76,10 @@ function money(n) {
 
 const BORDER = "1px solid rgba(127,127,127,.18)";
 
-function buildPanel(endpoint, refreshMs, headingText) {
+function buildPanel(endpoint, refreshMs, headingText, getSessionId) {
+  const sessionId = () => {
+    try { return typeof getSessionId === "function" ? getSessionId() : null; } catch { return null; }
+  };
   const root = document.createElement("div");
   root.style.cssText = [
     "padding:14px",
@@ -270,6 +273,8 @@ function buildPanel(endpoint, refreshMs, headingText) {
   // ---- keys ---------------------------------------------------------------
   // The gateway meters each key separately, so a second key is a second set of
   // per-model windows. Stored next to the plugin, never in opencode.json.
+  let keys = [];
+  let pins = {};
   const keysUrl = endpoint.replace(/\/usage\/?$/, "/keys");
   const keyBox = document.createElement("div");
   keyBox.style.cssText = "border-top:" + BORDER + ";padding-top:10px;display:flex;flex-direction:column;gap:6px";
@@ -283,29 +288,6 @@ function buildPanel(endpoint, refreshMs, headingText) {
   keyList.style.cssText = "display:flex;flex-direction:column;gap:3px";
   keyBox.appendChild(keyList);
 
-  const keyEdit = document.createElement("div");
-  keyEdit.style.cssText = "display:flex;gap:6px;align-items:center";
-
-  const keyInput = document.createElement("input");
-  keyInput.type = "password";
-  keyInput.placeholder = "paste a key to add…";
-  keyInput.style.cssText = [
-    "flex:1", "min-width:0", "padding:4px 8px", "border-radius:7px",
-    "border:1px solid rgba(127,127,127,.35)", "background:transparent", "color:inherit", "font:inherit",
-  ].join(";");
-
-  const keyAdd = document.createElement("button");
-  keyAdd.type = "button";
-  keyAdd.textContent = "Add";
-  keyAdd.style.cssText = [
-    "padding:4px 10px", "border-radius:7px", "border:1px solid rgba(127,127,127,.35)",
-    "background:rgba(127,127,127,.08)", "color:inherit", "cursor:pointer", "font:inherit", "font-weight:600",
-  ].join(";");
-
-  keyEdit.appendChild(keyInput);
-  keyEdit.appendChild(keyAdd);
-  keyBox.appendChild(keyEdit);
-
   const keyNote = document.createElement("div");
   keyNote.style.cssText = "opacity:.5;font-size:11px";
   keyNote.textContent = "saved to .fasfas-keys.json — each session sticks to one key";
@@ -314,33 +296,83 @@ function buildPanel(endpoint, refreshMs, headingText) {
 
   function renderKeys() {
     keyList.textContent = "";
-    if (!keys.length) {
-      const empty = document.createElement("div");
-      empty.textContent = "no keys — the credential OpenCode sends is used";
-      empty.style.cssText = "opacity:.5;font-size:11px";
-      keyList.appendChild(empty);
-      return;
-    }
-    for (const k of keys) {
+    // Two fixed slots, plus one more whenever the pool grows past them.
+    const slotCount = Math.max(2, keys.length);
+    for (let i = 1; i <= slotCount; i++) {
+      const current = keys[i - 1];
+
       const row = document.createElement("div");
-      row.style.cssText = "display:flex;gap:8px;align-items:center";
+      row.style.cssText = "display:flex;gap:6px;align-items:center";
 
       const label = document.createElement("span");
-      label.textContent = `#${k.index}  ${k.hint}`;
-      label.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums";
+      label.textContent = `Key ${i}`;
+      label.style.cssText = "flex:0 0 auto;min-width:42px;opacity:.65;font-size:11px";
 
-      const del = document.createElement("button");
-      del.type = "button";
-      del.textContent = "×";
-      del.title = "Remove this key";
-      del.style.cssText = [
-        "padding:0 7px", "border-radius:6px", "border:1px solid rgba(127,127,127,.3)",
-        "background:transparent", "color:inherit", "cursor:pointer", "font:inherit", "line-height:1.5",
+      const input = document.createElement("input");
+      input.type = "password";
+      input.placeholder = current ? current.hint : "not set";
+      input.style.cssText = [
+        "flex:1", "min-width:0", "padding:4px 8px", "border-radius:7px",
+        "border:1px solid rgba(127,127,127,.35)", "background:transparent", "color:inherit", "font:inherit",
       ].join(";");
-      del.onclick = () => saveKeys({ remove: k.index });
+
+      const apply = () => {
+        const v = input.value.trim();
+        if (!v) return;
+        input.value = "";
+        saveKeys({ set: i, key: v });
+      };
+
+      const set = document.createElement("button");
+      set.type = "button";
+      set.textContent = current ? "Replace" : "Set";
+      set.style.cssText = [
+        "padding:4px 9px", "border-radius:7px", "border:1px solid rgba(127,127,127,.35)",
+        "background:rgba(127,127,127,.08)", "color:inherit", "cursor:pointer", "font:inherit", "font-weight:600",
+      ].join(";");
+      set.onclick = apply;
 
       row.appendChild(label);
-      row.appendChild(del);
+      row.appendChild(input);
+      row.appendChild(set);
+
+      // Pin the routed session to this key: its requests then follow this key's
+      // windows, which is how two sessions double the available capacity.
+      if (current) {
+        const sid = sessionId();
+        const isPinned = !!sid && Number(pins[sid]) === i;
+        const pin = document.createElement("button");
+        pin.type = "button";
+        pin.textContent = isPinned ? "Pinned" : "Pin";
+        pin.title = sid ? `Use key ${i} for this session` : "Open a session first";
+        pin.disabled = !sid;
+        pin.style.cssText = [
+          "padding:4px 9px", "border-radius:7px",
+          "border:1px solid " + (isPinned ? "rgba(120,200,140,.65)" : "rgba(127,127,127,.35)"),
+          "background:" + (isPinned ? "rgba(120,200,140,.16)" : "transparent"),
+          "color:inherit", "cursor:" + (sid ? "pointer" : "default"),
+          "font:inherit", "font-weight:600", "opacity:" + (sid ? "1" : ".45"),
+        ].join(";");
+        pin.onclick = () => {
+          const id = sessionId();
+          if (id) saveKeys({ pin: { session: id, key: i } });
+        };
+        row.appendChild(pin);
+      }
+
+      if (current) {
+        const del = document.createElement("button");
+        del.type = "button";
+        del.textContent = "×";
+        del.title = `Remove key ${i}`;
+        del.style.cssText = [
+          "padding:0 7px", "border-radius:6px", "border:1px solid rgba(127,127,127,.3)",
+          "background:transparent", "color:inherit", "cursor:pointer", "font:inherit", "line-height:1.5",
+        ].join(";");
+        del.onclick = () => saveKeys({ remove: i });
+        row.appendChild(del);
+      }
+
       keyList.appendChild(row);
     }
   }
@@ -377,7 +409,6 @@ function buildPanel(endpoint, refreshMs, headingText) {
 
   let data = null;
   let error = null;
-  let keys = [];
   // Live slot usage per model: used requests in the current window vs the cap.
   let slots = {};
 
@@ -532,6 +563,7 @@ function buildPanel(endpoint, refreshMs, headingText) {
         const kj = await keysRes.json();
         if (Array.isArray(kj.keys)) {
           keys = kj.keys;
+          pins = kj.pins || {};
           renderKeys();
         }
       }
@@ -634,7 +666,10 @@ module.exports = {
           cached: true,
         },
         list: (input) => (input.open.includes("usage") ? [tab] : []),
-        render: () => buildPanel(endpoint, refreshMs, ctx.t("heading")),
+        render: () => buildPanel(endpoint, refreshMs, ctx.t("heading"), () => {
+          const s = ctx.sessions && ctx.sessions.current ? ctx.sessions.current() : null;
+          return s && s.id ? s.id : null;
+        }),
       });
 
       ctx.add(MenuItem, () => ({

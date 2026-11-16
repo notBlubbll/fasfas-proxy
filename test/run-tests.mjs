@@ -501,16 +501,30 @@ log("\nkey pool");
   });
 
   let before = seen.length;
-  for (let i = 0; i < 2; i++) await chat({}).then((x) => x.text());
-  const auths = seen.slice(before).map((c) => c.auth);
-  ok("session-less requests round-robin the pool",
-    new Set(auths).size === 2 && auths.every((a) => a.startsWith("Bearer sk-test-")),
-    JSON.stringify(auths));
+  await chat({}).then((x) => x.text());
+  ok("a session-less request uses the first key", seen[seen.length - 1].auth === "Bearer sk-test-aaaa1111", seen[seen.length - 1].auth);
+
+  before = seen.length;
+  await chat({ "x-opencode-session-id": "ses_alpha" }).then((x) => x.text());
+  await chat({ "x-opencode-session-id": "ses_beta" }).then((x) => x.text());
+  const spread = seen.slice(before).map((c) => c.auth);
+  ok("two sessions land on different keys", new Set(spread).size === 2 && spread.every((a) => a.startsWith("Bearer sk-test-")), JSON.stringify(spread));
 
   before = seen.length;
   for (let i = 0; i < 2; i++) await chat({ "x-opencode-session-id": "ses_pinned" }).then((x) => x.text());
   const pinned = seen.slice(before).map((c) => c.auth);
   ok("one session sticks to one key", new Set(pinned).size === 1 && pinned[0].startsWith("Bearer sk-test-"), JSON.stringify(pinned));
+
+  // explicit pin moves a session to the other key
+  const target = spread[0] === "Bearer sk-test-aaaa1111" ? 2 : 1;
+  r = await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ pin: { session: "ses_alpha", key: target } }) });
+  j = await r.json();
+  ok("pin is recorded", j.pins?.ses_alpha === target, JSON.stringify(j.pins));
+
+  before = seen.length;
+  await chat({ "x-opencode-session-id": "ses_alpha" }).then((x) => x.text());
+  const afterPin = seen[seen.length - 1].auth;
+  ok("pinned session follows the chosen key", afterPin === (target === 1 ? "Bearer sk-test-aaaa1111" : "Bearer sk-test-bbbb2222"), afterPin);
 
   r = await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ remove: 1 }) });
   j = await r.json();
