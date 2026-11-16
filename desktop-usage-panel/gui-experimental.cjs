@@ -269,6 +269,21 @@ function buildPanel(endpoint, refreshMs, headingText) {
 
   let data = null;
   let error = null;
+  // Live slot usage per model: used requests in the current window vs the cap.
+  let slots = {};
+
+  function slotCell(el, name) {
+    const s = slots[name];
+    if (!s || !s.max) return el;
+    const used = Math.min(s.used || 0, s.max);
+    const tag = document.createElement("span");
+    tag.textContent = ` (${used}/${s.max})`;
+    tag.style.cssText = used >= s.max ? "opacity:.95;font-weight:650" : "opacity:.55";
+    tag.title = `${used} of ${s.max} requests in the window` +
+      (s.tokenMax ? ` · ${Math.round((s.tokensUsed || 0) / 1000)}k of ${Math.round(s.tokenMax / 1000)}k tokens` : "");
+    el.appendChild(tag);
+    return el;
+  }
 
   function th(text, align) {
     const el = document.createElement("th");
@@ -295,7 +310,7 @@ function buildPanel(endpoint, refreshMs, headingText) {
       "white-space:nowrap",
       opts.strong ? "font-weight:650" : "",
       opts.muted ? "opacity:.6" : "",
-      opts.model ? "max-width:130px;overflow:hidden;text-overflow:ellipsis" : "",
+      opts.model ? "max-width:190px;overflow:hidden;text-overflow:ellipsis" : "",
     ].join(";");
     if (opts.model) el.title = text;
     return el;
@@ -341,7 +356,7 @@ function buildPanel(endpoint, refreshMs, headingText) {
     const rows = Object.entries(models).sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0) || (b[1].output || 0) - (a[1].output || 0));
     for (const [name, m] of rows) {
       const tr = document.createElement("tr");
-      tr.appendChild(td(name, "left", { model: true }));
+      tr.appendChild(slotCell(td(name, "left", { model: true }), name));
       tr.appendChild(td(String(m.requests), "right"));
       tr.appendChild(td(fmt(m.input), "right"));
       tr.appendChild(td(fmt(m.output), "right"));
@@ -385,12 +400,30 @@ function buildPanel(endpoint, refreshMs, headingText) {
     refreshBtn.style.opacity = ".45";
     refreshBtn.textContent = "…";
     try {
-      const r = await fetch(endpoint, { cache: "no-store" });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      data = await r.json();
+      const [usageRes, statusRes] = await Promise.all([
+        fetch(endpoint, { cache: "no-store" }),
+        fetch(endpoint.replace(/\/usage\/?$/, "/status"), { cache: "no-store" }).catch(() => null),
+      ]);
+      if (!usageRes.ok) throw new Error("HTTP " + usageRes.status);
+      data = await usageRes.json();
       error = null;
+
+      // Slot usage for the model column: live limiter state, plus the configured
+      // caps so a model with no traffic yet still shows "0/6".
+      slots = {};
+      if (statusRes && statusRes.ok) {
+        const s = await statusRes.json();
+        for (const [name, v] of Object.entries(s.models || {})) {
+          slots[name] = { used: v.used || 0, max: v.max || 0, tokensUsed: v.tokensUsed || 0, tokenMax: v.tokenMax || 0 };
+        }
+        for (const [name, spec] of Object.entries(s.limits || {})) {
+          const m = /^(\d+)\//.exec(String(spec));
+          if (m && !slots[name]) slots[name] = { used: 0, max: Number(m[1]), tokensUsed: 0, tokenMax: 0 };
+        }
+      }
     } catch (e) {
       error = (e && e.message) || "unreachable";
+      slots = {};
     } finally {
       inFlight = false;
       refreshBtn.style.opacity = "1";
