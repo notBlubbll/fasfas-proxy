@@ -701,11 +701,13 @@ function touchSession(sid, model) {
 
 // Remember that this session took a request slot on `model` now, so the panel can
 // show how much of its key's per-minute cap the session is using.
-function noteSessionSlot(a, model) {
+function noteSessionSlot(a, model, reservation) {
   if (!a || !model) return;
   const now = Date.now();
   a.slots = (a.slots || []).filter((x) => now - x.t < 5 * 60 * 1000);
-  a.slots.push({ t: now, model });
+  // `entry` is the limiter's own token record, so the figure follows the
+  // reconciliation to the real token count once the request finishes.
+  a.slots.push({ t: now, model, entry: reservation ? reservation.entry : null });
 }
 
 let keysSaveTimer = null;
@@ -845,10 +847,16 @@ function keysReport() {
     // the current window, next to what every session on that key used together.
     let limit = null;
     const lim = slot && a.model ? limiterFor(a.model, slot) : null;
-    if (lim && lim.max > 0) {
+    if (lim && (lim.max > 0 || lim.tokenMax > 0)) {
       const snap = lim.snapshot(now);
-      const mine = (a.slots || []).filter((x) => x.model === a.model && now - x.t < snap.windowMs).length;
-      limit = { used: Math.min(mine, snap.max), max: snap.max, keyUsed: snap.used, windowMs: snap.windowMs };
+      const mine = (a.slots || []).filter((x) => x.model === a.model && now - x.t < snap.windowMs);
+      const myTokens = (a.slots || [])
+        .filter((x) => x.model === a.model && x.entry && now - x.t < snap.tokenWindowMs)
+        .reduce((n, x) => n + (x.entry.n || 0), 0);
+      limit = {
+        used: Math.min(mine.length, snap.max), max: snap.max, keyUsed: snap.used, windowMs: snap.windowMs,
+        tokens: myTokens, tokenMax: snap.tokenMax, keyTokens: snap.tokensUsed, tokenWindowMs: snap.tokenWindowMs,
+      };
     }
     sessions.push({
       id,
@@ -1532,7 +1540,7 @@ async function handle(req, res) {
       if (limiterFor(model, keySlot)) {
         PROXY_STATE.queued++;
         try { reservation = await acquire(model, estTokens, 0, keySlot); } finally { PROXY_STATE.queued--; }
-        if (reservation && !reservation.spill) noteSessionSlot(sessionAct, model);
+        if (reservation && !reservation.spill) noteSessionSlot(sessionAct, model, reservation);
       }
       return true;
     };
@@ -1545,7 +1553,7 @@ async function handle(req, res) {
       if (reservation && reservation.spill) {
         await spillOver(`a slot would take over ${rule.maxWaitMs / 1000}s`);
       } else {
-        noteSessionSlot(sessionAct, model);
+        noteSessionSlot(sessionAct, model, reservation);
         const waited = Date.now() - queuedAt;
         if (waited > QUEUE_LOG_MS) log(`slot for ${model} after ${(waited / 1000).toFixed(1)}s`);
       }

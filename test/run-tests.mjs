@@ -681,7 +681,7 @@ log("\nlive sessions decide placement, pins follow their key");
   await as("ses_limit");
   const lk = await (await fetch(`${base}/keys`)).json();
   const lm = lk.sessions.find((s) => s.id === "ses_limit")?.limit;
-  ok("a session shows how much of its key's cap it used", lm && lm.max === 2 && lm.used === 1 && lm.keyUsed >= 1, JSON.stringify(lm));
+  ok("a session shows how much of its key's cap it used", lm && lm.max === 2 && lm.used === 1 && lm.keyUsed >= 1 && typeof lm.tokens === "number" && "tokenMax" in lm, JSON.stringify(lm));
 
   await api({ pin: { session: "ses_remap", key: 2 } });
   await as("ses_remap");

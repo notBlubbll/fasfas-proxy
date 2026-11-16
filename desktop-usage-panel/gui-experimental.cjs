@@ -273,9 +273,9 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     head.appendChild(th("Session", "left"));
     head.appendChild(th("Key", "center", "the key this session is pinned to; all its requests use that key's limits"));
     head.appendChild(th("Model", "left"));
-    head.appendChild(th("Limit", "right", "requests this session sent in the last minute / its key's per-minute cap for the model"));
+    head.appendChild(th("Req", "right", "requests this session sent in the last minute / its key's per-minute cap for the model. Empty once the minute has passed."));
+    head.appendChild(th("TPM", "right", "tokens this session used in the last minute, as a share of its key's per-minute token cap for the model. Empty once the minute has passed."));
     head.appendChild(th("State", "left"));
-    head.appendChild(th("Req", "right", "requests this session has made since the proxy started"));
     tbl.appendChild(head);
 
     sessions.forEach((s, i) => {
@@ -299,11 +299,24 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       }));
 
       const lim = s.limit;
-      tr.appendChild(td(lim ? `${lim.used}/${lim.max}` : "–", "right", {
-        last, muted: !lim || lim.used === 0, strong: !!lim && lim.used >= lim.max,
-        title: lim
+      // Both figures are rolling-minute counts that the proxy recomputes on every
+      // poll, so they empty by themselves as requests age out of the window.
+      const reqShown = !!lim && lim.max > 0 && lim.used > 0;
+      tr.appendChild(td(reqShown ? `${lim.used}/${lim.max}` : "–", "right", {
+        last, muted: !reqShown, strong: reqShown && lim.used >= lim.max,
+        title: lim && lim.max > 0
           ? `this session: ${lim.used} of ${lim.max} requests in the last ${Math.round(lim.windowMs / 1000)}s on Key ${s.key} (${s.model})\n` +
             `everyone on Key ${s.key}: ${lim.keyUsed} of ${lim.max}`
+          : "",
+      }));
+
+      const tpmShown = !!lim && lim.tokenMax > 0 && lim.tokens > 0;
+      const tpm = tpmShown ? (lim.tokens / lim.tokenMax) * 100 : 0;
+      tr.appendChild(td(tpmShown ? `${tpm < 10 ? tpm.toFixed(1) : Math.round(tpm)}%` : "–", "right", {
+        last, muted: !tpmShown, strong: tpmShown && tpm >= 100,
+        title: lim && lim.tokenMax > 0
+          ? `this session: ${lim.tokens.toLocaleString()} of ${lim.tokenMax.toLocaleString()} tokens in the last ${Math.round(lim.tokenWindowMs / 1000)}s on Key ${s.key} (${s.model})\n` +
+            `everyone on Key ${s.key}: ${lim.keyTokens.toLocaleString()} (${((lim.keyTokens / lim.tokenMax) * 100).toFixed(1)}%)`
           : "",
       }));
 
@@ -319,7 +332,6 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       state.style.fontVariantNumeric = "tabular-nums";
       tr.appendChild(state);
 
-      tr.appendChild(td(String(s.requests || 0), "right", { last, muted: true }));
       tbl.appendChild(tr);
     });
     sessionsList.appendChild(tbl);
