@@ -61,38 +61,42 @@ const UPSTREAM = (() => {
 //
 // Defaults measured against the live gateway (dashboard + 429 probes):
 //   sonnet-5.5          6 req/min
-//   qwen3.8-27b        20 req/min
 //   glm-5.3-flash      20 req/min
 //   haiku-5.5          20 req/min
 //   deepseek-v4.1-flash 40 req/min, 2,000,000 tokens/min
 // Per key, as measured on one key. The account total is these caps times the
 // number of configured keys, so a second key doubles what the panel shows.
 const LIMITS_DEFAULT =
-  "sonnet-5.5=6/60s,qwen3.8-27b=20/60s,glm-5.3-flash=20/60s,glm-5.2=10/60s," +
+  "sonnet-5.5=6/60s,glm-5.3-flash=20/60s,glm-5.2=10/60s," +
   "haiku-5.5=20/60s,deepseek-v4.1-flash=40/60s";
 
 // Token-per-minute budget per model, straight from the gateway dashboard.
 // Env format (FASFAS_PROXY_TOKEN_LIMITS): "haiku-5.5=2000000/60s".
 // Unlisted models have no token budget.
 const TOKEN_LIMITS_DEFAULT =
-  "qwen3.8-27b=3000000/60s,deepseek-v4.1-flash=2000000/60s,glm-5.3-flash=2000000/60s," +
+  "deepseek-v4.1-flash=2000000/60s,glm-5.3-flash=2000000/60s," +
   "glm-5.2=1000000/60s,haiku-5.5=2000000/60s,sonnet-5.5=1000000/60s";
 
 // USD per 1M tokens, from the OpenCode Go table (off-peak where a model has
 // peak/off-peak pricing) and the Console table for models Go does not list.
-// qwen3.8-27b is not published anywhere, so it uses the Qwen3.8 Flash rates.
 // Override with FASFAS_PROXY_PRICING="model=in/out/cached,...".
 const PRICING_DEFAULT = {
   "deepseek-v4.1-flash": { in: 0.15, out: 0.60, cached: 0.003 },
   "glm-5.3-flash": { in: 0.15, out: 0.50, cached: 0.03 },
   "haiku-5.5": { in: 0.10, out: 0.50, cached: 0.01 },
   "sonnet-5.5": { in: 2.00, out: 10.00, cached: 0.10 },
-  "qwen3.8-27b": { in: 0.15, out: 0.47, cached: 0.016 },
   // OpenCode Go table. The gateway lists it at $0, like its other models.
   "glm-5.2": { in: 1.40, out: 4.40, cached: 0.26 },
   // Image generation is not billed per token here.
   "mai-image-2.6-flash": { in: 0, out: 0, cached: 0 },
   "mai-image-2.6": { in: 0, out: 0, cached: 0 },
+};
+
+// Models the gateway no longer lists. Kept only so requests already in the usage
+// log still get a cost; they are not offered, listed or limited. To bring one
+// back, move it into PRICING_DEFAULT and restore its limits above.
+const RETIRED_PRICING = {
+  "qwen3.8-27b": { in: 0.15, out: 0.47, cached: 0.016 }, // gone from the gateway (404)
 };
 
 function parsePricing(src) {
@@ -115,7 +119,7 @@ const PRICING = { ...PRICING_DEFAULT, ...parsePricing(process.env.FASFAS_PROXY_P
 // Cost of one record. Cached tokens are part of the prompt count and are billed
 // at the cached-read rate instead of the full input rate.
 function recordCost(r) {
-  const p = PRICING[r.m];
+  const p = PRICING[r.m] || RETIRED_PRICING[r.m];
   if (!p) return 0;
   const cached = Math.min(r.c || 0, r.i || 0);
   const fresh = Math.max(0, (r.i || 0) - cached);

@@ -44,64 +44,6 @@
                 "chunkTimeout": 600000
             },
             "models": {
-                "qwen3.8-27b": {
-                    "name": "Qwen 3.8 27B",
-                    "cost": {
-                        "input": 0.15,
-                        "output": 0.47,
-                        "cache_read": 0.016,
-                        "cache_write": 0.2
-                    },
-                    "capabilities": {
-                        "tools": true,
-                        "input": [
-                            "text",
-                            "image"
-                        ],
-                        "output": [
-                            "text"
-                        ]
-                    },
-                    "compatibility": {
-                        "reasoningField": "reasoning"
-                    },
-                    "variants": [
-                        {
-                            "id": "low",
-                            "settings": {
-                                "reasoningEffort": "low"
-                            }
-                        },
-                        {
-                            "id": "medium",
-                            "settings": {
-                                "reasoningEffort": "medium"
-                            }
-                        },
-                        {
-                            "id": "high",
-                            "settings": {
-                                "reasoningEffort": "high"
-                            }
-                        },
-                        {
-                            "id": "xhigh",
-                            "settings": {
-                                "reasoningEffort": "xhigh"
-                            }
-                        },
-                        {
-                            "id": "max",
-                            "settings": {
-                                "reasoningEffort": "max"
-                            }
-                        }
-                    ],
-                    "limit": {
-                        "context": 1000000,
-                        "output": 65536
-                    }
-                },
                 "deepseek-v4.1-flash": {
                     "name": "DeepSeek V4.1 Flash",
                     "cost": {
