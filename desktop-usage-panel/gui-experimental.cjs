@@ -273,6 +273,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     head.appendChild(th("Session", "left"));
     head.appendChild(th("Key", "center", "the key this session is pinned to; all its requests use that key's limits"));
     head.appendChild(th("Model", "left"));
+    head.appendChild(th("Limit", "right", "requests this session sent in the last minute / its key's per-minute cap for the model"));
     head.appendChild(th("State", "left"));
     head.appendChild(th("Req", "right", "requests this session has made since the proxy started"));
     tbl.appendChild(head);
@@ -295,6 +296,15 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       tr.appendChild(td(s.model ? s.model + (spilled ? " *" : "") : "–", "left", {
         last, muted: !s.model, model: true,
         title: spilled ? `overflow: ${s.from} was full, so this session's request runs on ${s.model}` : (s.model || ""),
+      }));
+
+      const lim = s.limit;
+      tr.appendChild(td(lim ? `${lim.used}/${lim.max}` : "–", "right", {
+        last, muted: !lim || lim.used === 0, strong: !!lim && lim.used >= lim.max,
+        title: lim
+          ? `this session: ${lim.used} of ${lim.max} requests in the last ${Math.round(lim.windowMs / 1000)}s on Key ${s.key} (${s.model})\n` +
+            `everyone on Key ${s.key}: ${lim.keyUsed} of ${lim.max}`
+          : "",
       }));
 
       const state = td("", "left", { last });

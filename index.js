@@ -699,6 +699,15 @@ function touchSession(sid, model) {
   return a;
 }
 
+// Remember that this session took a request slot on `model` now, so the panel can
+// show how much of its key's per-minute cap the session is using.
+function noteSessionSlot(a, model) {
+  if (!a || !model) return;
+  const now = Date.now();
+  a.slots = (a.slots || []).filter((x) => now - x.t < 5 * 60 * 1000);
+  a.slots.push({ t: now, model });
+}
+
 let keysSaveTimer = null;
 function saveKeysSoon() {
   if (keysSaveTimer) return;
@@ -831,9 +840,20 @@ function keysReport() {
   const sessions = [];
   for (const [id, a] of sessionActivity) {
     if (now - a.last > SESSION_LIVE_MS) continue;
+    const slot = sessionKeyPins.get(id) || 0;
+    // How much of the key's request cap on this model the session itself used in
+    // the current window, next to what every session on that key used together.
+    let limit = null;
+    const lim = slot && a.model ? limiterFor(a.model, slot) : null;
+    if (lim && lim.max > 0) {
+      const snap = lim.snapshot(now);
+      const mine = (a.slots || []).filter((x) => x.model === a.model && now - x.t < snap.windowMs).length;
+      limit = { used: Math.min(mine, snap.max), max: snap.max, keyUsed: snap.used, windowMs: snap.windowMs };
+    }
     sessions.push({
       id,
-      key: sessionKeyPins.get(id) || 0,
+      key: slot,
+      limit,
       active: a.active,
       requests: a.requests,
       model: a.model,
@@ -1512,6 +1532,7 @@ async function handle(req, res) {
       if (limiterFor(model, keySlot)) {
         PROXY_STATE.queued++;
         try { reservation = await acquire(model, estTokens, 0, keySlot); } finally { PROXY_STATE.queued--; }
+        if (reservation && !reservation.spill) noteSessionSlot(sessionAct, model);
       }
       return true;
     };
@@ -1524,6 +1545,7 @@ async function handle(req, res) {
       if (reservation && reservation.spill) {
         await spillOver(`a slot would take over ${rule.maxWaitMs / 1000}s`);
       } else {
+        noteSessionSlot(sessionAct, model);
         const waited = Date.now() - queuedAt;
         if (waited > QUEUE_LOG_MS) log(`slot for ${model} after ${(waited / 1000).toFixed(1)}s`);
       }
