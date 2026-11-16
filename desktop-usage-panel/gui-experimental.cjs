@@ -413,8 +413,12 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   keyBox.style.cssText = "border-top:" + BORDER + ";padding-top:10px;display:flex;flex-direction:column;gap:6px";
 
   const keyHead = document.createElement("div");
-  keyHead.textContent = "Keys";
-  keyHead.style.cssText = "font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;opacity:.55";
+  // Collapsed by default: keys are masked, but there is no reason to keep them on
+  // screen. Click the heading to open.
+  let keysOpen = false;
+  keyHead.style.cssText = "font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;opacity:.55;cursor:pointer;user-select:none;-webkit-user-select:none";
+  keyHead.setAttribute("role", "button");
+  keyHead.tabIndex = 0;
   keyBox.appendChild(keyHead);
 
   const keyList = document.createElement("div");
@@ -426,6 +430,19 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   keyNote.textContent = "saved to keys.json - each session sticks to one key";
   keyBox.appendChild(keyNote);
   root.appendChild(keyBox);
+
+  function paintKeysOpen() {
+    keyHead.textContent = `${keysOpen ? "▾" : "▸"} Keys` + (keys.length ? ` · ${keys.length}` : "");
+    keyHead.setAttribute("aria-expanded", String(keysOpen));
+    keyHead.title = keysOpen ? "Hide keys" : "Show keys";
+    keyList.style.display = keysOpen ? "flex" : "none";
+    keyNote.style.display = keysOpen ? "block" : "none";
+  }
+  keyHead.onclick = () => { keysOpen = !keysOpen; paintKeysOpen(); };
+  keyHead.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); keyHead.onclick(); }
+  };
+  paintKeysOpen();
 
   // Rows exist only for keys that are configured. Each row is one masked field
   // and four actions: Show reveals the value, Edit makes the field editable
@@ -458,6 +475,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   let keySig = "";
 
   function renderKeys() {
+    paintKeysOpen();
     keyList.textContent = "";
     if (keys.length === 0) {
       const empty = document.createElement("div");
