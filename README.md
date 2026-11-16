@@ -34,7 +34,7 @@ on a different model instead of killing the turn.
 | --- | --- | --- | --- | --- | --- | --- |
 | `deepseek-v4.1-flash` | 1,048,576 | 65,536 | ✅ native | yes | 40 | 2,000,000 |
 | `glm-5.3-flash` | 1,048,576 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
-| `glm-5.2` | 1,048,576 | 65,536 | not tested | yes | 10 | 1,000,000 |
+| `glm-5.2` | 1,048,576 | 65,536 | ❌ text only | yes | 10 | 1,000,000 |
 | `haiku-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
 | `sonnet-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 6 | 1,000,000 |
 | `qwen3.8-27b` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 3,000,000 |
@@ -61,9 +61,12 @@ usage table, with no request or token limits on the gateway:
   and 11M tok/min, reached only by running every model at once; saturating one
   model leaves the others untouched.
 - **Images are passed through untouched.** The other chat models see images natively
-  (verified: haiku and sonnet name all four quadrants of a 64×64 image; `glm-5.2`
-  is not tested), so the
+  (verified: haiku and sonnet name all four quadrants of a 64×64 image), so the
   proxy only captions an image when the upstream actually rejects it.
+- `glm-5.2` is text only: an image request gets `404 No endpoints found that
+  support image input` from the gateway. For code it passed a check: it wrote a
+  `parseDuration` function that passed 11 of 11 test cases in about 2s, and it
+  returned a correct tool call.
 - `sonnet-5.5` is the scarcest at 6 requests/minute per key (12 with two keys).
   Point subagents at `deepseek-v4.1-flash` (40/min per key) rather than letting a
   fan-out eat sonnet's budget.

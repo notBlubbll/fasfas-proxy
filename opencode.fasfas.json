@@ -226,8 +226,7 @@
                     "capabilities": {
                         "tools": true,
                         "input": [
-                            "text",
-                            "image"
+                            "text"
                         ],
                         "output": [
                             "text"
