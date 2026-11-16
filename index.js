@@ -31,7 +31,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 // the usage snapshot again: the new copy owns them, and a late write from the old
 // one (a debounced save) would put stale state back.
 let retired = false;
-// Identifies this copy of the module, so a status call shows which copy answered.
+// The original file and its folder. A hot reload loads a copy of this file under
+// another name (see hotReload), so these are fixed by the first copy and handed on.
+const ENTRY_FILE = (globalThis.__fasfasEntry ||= fileURLToPath(import.meta.url));
+const HOME_DIR = path.dirname(ENTRY_FILE);
+// Identifies this copy of the module (a status call shows which copy answered).
 const INSTANCE_ID = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 // Responses this copy is still writing, so a hot reload can mark them to close
 // their connection when they finish.
@@ -351,9 +355,9 @@ function usageReport() {
   return out;
 }
 
-const LOG_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-proxy.log");
-const USAGE_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-usage.json");
-const USAGE_LOG = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-usage.jsonl");
+const LOG_FILE = path.join(HOME_DIR, ".fasfas-proxy.log");
+const USAGE_FILE = path.join(HOME_DIR, ".fasfas-usage.json");
+const USAGE_LOG = path.join(HOME_DIR, ".fasfas-usage.jsonl");
 const USAGE_LOG_MAX_BYTES = 5 * 1024 * 1024;
 
 function log(msg) {
@@ -636,9 +640,9 @@ function clearOverflowActive(target, from) {
 // and no other. There is no round-robin.
 // FASFAS_PROXY_KEYS_FILE moves the file (the tests use a throwaway one).
 const KEYS_FILE = process.env.FASFAS_PROXY_KEYS_FILE ||
-  path.join(path.dirname(fileURLToPath(import.meta.url)), "keys.json");
+  path.join(HOME_DIR, "keys.json");
 // The file used to be hidden; it is moved to keys.json on first start.
-const LEGACY_KEYS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-keys.json");
+const LEGACY_KEYS_FILE = path.join(HOME_DIR, ".fasfas-keys.json");
 const MAX_KEYS = 8;
 const CORS_HEADERS = { "cache-control": "no-store", "access-control-allow-origin": "*" };
 let keyPool = [];
@@ -1945,16 +1949,21 @@ async function hotReload() {
   const old = globalThis.__fasfasProxyServer;
   if (!old) { log("hot reload: nothing is running to replace"); return false; }
 
-  const href = pathToFileURL(fileURLToPath(import.meta.url)).href + `?reload=${Date.now()}`;
+  // Load the new code from a uniquely named copy. A "?reload=" query is not
+  // enough: Bun, which runs the OpenCode host, can hand back the module it already
+  // has for the same file, and the "new" copy would then be the old code.
+  const copy = path.join(HOME_DIR, `.fasfas-reload-${Date.now()}.mjs`);
   let mod;
   globalThis.__fasfasHotReloading = true; // stops the new copy auto-starting itself
   try {
-    mod = await import(href);
+    fs.copyFileSync(ENTRY_FILE, copy);
+    mod = await import(pathToFileURL(copy).href);
   } catch (e) {
     log(`hot reload aborted: the new index.js did not load (${e?.message || e}); still serving the old code`);
     return false;
   } finally {
     globalThis.__fasfasHotReloading = false;
+    try { fs.unlinkSync(copy); } catch {} // already loaded into memory
   }
   if (typeof mod?.default?.setup !== "function") {
     log("hot reload aborted: the new index.js has no plugin entry; still serving the old code");
