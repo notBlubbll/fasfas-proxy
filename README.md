@@ -231,10 +231,15 @@ is unchanged outside compaction.
 
 ## Keys
 
+> **One key per user.** Every user should have exactly one key. Using more than
+> one is at your own risk: the gateway may treat extra keys as a way around its
+> limits, and any consequence of that is yours, not this project's. Multi-key
+> support exists because the proxy can handle it, not because it is endorsed.
+
 The gateway meters each key on its own, so a second key is a second set of
 per-model windows. Keys are added in the panel's **Keys** section and stored in
 `keys.json` next to the plugin (never in the repo, never in `opencode.json`,
-which keeps one credential only as the fallback).
+which holds only a placeholder credential).
 
 - **One session is one key.** A session is pinned to a key the first time it is
   seen, and every request it makes is charged to that key's windows and no other.
