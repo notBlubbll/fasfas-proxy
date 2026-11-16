@@ -24,7 +24,19 @@ import { request as httpsRequest } from "node:https";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+// Set by hotReload() on the copy of this file that is being replaced. That copy
+// keeps finishing the requests it already has, but it must not write keys.json or
+// the usage snapshot again: the new copy owns them, and a late write from the old
+// one (a debounced save) would put stale state back.
+let retired = false;
+// Identifies this copy of the module, so a status call shows which copy answered.
+const INSTANCE_ID = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+// Responses this copy is still writing, so a hot reload can mark them to close
+// their connection when they finish.
+const activeResponses = new Set();
+
 
 const TAG = "[fasfas-proxy]";
 const UPSTREAM_DEFAULT = "https://ai.coffeevps.com/v1";
@@ -167,6 +179,7 @@ function saveUsageSoon() {
   if (usageSaveTimer) return;
   usageSaveTimer = setTimeout(() => {
     usageSaveTimer = null;
+    if (retired) return;
     try {
       fs.writeFileSync(USAGE_FILE, JSON.stringify({ since: usage.since, lifetime: usage.lifetime }));
     } catch {}
@@ -718,6 +731,7 @@ function loadKeys() {
 }
 
 function saveKeys() {
+  if (retired) return;
   try {
     const pins = {};
     const seen = {};
@@ -1209,6 +1223,12 @@ function readRequest(body) {
 async function handle(req, res) {
   const url = new URL(req.url, `http://${LISTEN_HOST}`);
 
+  // After a hot reload this copy only drains. Its connections must not stay open
+  // for the client to reuse, or the next request would still reach the old code.
+  activeResponses.add(res);
+  res.on("close", () => activeResponses.delete(res));
+  if (retired) { try { res.setHeader("connection", "close"); } catch {} }
+
   // CORS preflight for the panel's POST /ping.
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -1218,6 +1238,17 @@ async function handle(req, res) {
       "access-control-max-age": "600",
     });
     return res.end();
+  }
+
+  // Replace the running code with the current index.js, no service restart. The
+  // custom header makes this a non-simple request, so a web page cannot trigger
+  // it: our CORS preflight does not allow the header.
+  if (req.method === "POST" && url.pathname === "/admin/reload") {
+    if (req.headers["x-fasfas-admin"] !== "1") {
+      return sendJson(res, 403, JSON.stringify({ error: "send the x-fasfas-admin: 1 header" }));
+    }
+    res.on("finish", () => setTimeout(() => { hotReload().catch((e) => log(`hot reload failed: ${e?.stack || e}`)); }, 100));
+    return send(res, 200, "application/json", JSON.stringify({ reloading: true }) + "\n", { "cache-control": "no-store" });
   }
 
   if (req.method === "GET" && url.pathname === "/healthz") {
@@ -1342,6 +1373,7 @@ async function handle(req, res) {
     }
     return send(res, 200, "application/json", JSON.stringify({
       proxy: "fasfas-proxy",
+      instance: INSTANCE_ID,
       upstream: UPSTREAM.href,
       uptimeMs: now - PROXY_STATE.started,
       active: PROXY_STATE.active,
@@ -1812,8 +1844,6 @@ function sendJson(res, status, text) {
 // ---- server ----------------------------------------------------------------
 
 async function startServer(port, mode) {
-  loadUsage();
-  loadKeys();
   const server = createServer();
   server.on("request", (req, res) => {
     handle(req, res).catch((err) => {
@@ -1858,6 +1888,10 @@ async function startServer(port, mode) {
     log(`reusing the running instance on port ${port} (a reload does not restart it)`);
     return;
   }
+  // Only the copy that will serve loads the state files. A duplicate copy stops
+  // above and never reads or writes them.
+  loadUsage();
+  loadKeys();
   globalThis.__fasfasProxyServer = server;
   server.__fasfasPort = port;
 
@@ -1895,6 +1929,66 @@ async function startServer(port, mode) {
   }
 }
 
+// Swap in new code without restarting the OpenCode service. The new index.js is
+// imported and checked FIRST: if it fails to load, the running proxy is left
+// exactly as it was. Only then does the old copy stop taking new connections (the
+// requests it already has run to completion on the old code) and the new copy
+// bind the same port.
+//
+// What carries over: keys, pins and usage history (files). What does not: the
+// in-memory rate windows, which start empty, so the first minute after a reload
+// can send a little more than a key's cap upstream; the 429 retry absorbs that.
+async function hotReload() {
+  const old = globalThis.__fasfasProxyServer;
+  if (!old) { log("hot reload: nothing is running to replace"); return false; }
+
+  const href = pathToFileURL(fileURLToPath(import.meta.url)).href + `?reload=${Date.now()}`;
+  let mod;
+  globalThis.__fasfasHotReloading = true; // stops the new copy auto-starting itself
+  try {
+    mod = await import(href);
+  } catch (e) {
+    log(`hot reload aborted: the new index.js did not load (${e?.message || e}); still serving the old code`);
+    return false;
+  } finally {
+    globalThis.__fasfasHotReloading = false;
+  }
+  if (typeof mod?.default?.setup !== "function") {
+    log("hot reload aborted: the new index.js has no plugin entry; still serving the old code");
+    return false;
+  }
+
+  log("hot reload: handing the port to the new code");
+  saveKeys();
+  try { fs.writeFileSync(USAGE_FILE, JSON.stringify({ since: usage.since, lifetime: usage.lifetime })); } catch {}
+  retired = true;
+  // Requests already being served finish on this copy, and then close their
+  // connection (headers not sent yet can still carry the instruction).
+  for (const r of activeResponses) {
+    try { if (!r.headersSent) r.setHeader("connection", "close"); } catch {}
+  }
+  globalThis.__fasfasProxyServer = null;
+  try { old.close(); } catch {}              // stop listening, keep in-flight requests
+  // Keep-alive sockets that were busy at this moment become idle when their
+  // request finishes, and would otherwise stay attached to the old copy for good.
+  // Sweep them for a while so clients move to the new copy.
+  const sweep = () => { try { old.closeIdleConnections?.(); } catch {} };
+  sweep();
+  const sweeper = setInterval(sweep, 250);
+  try { sweeper.unref?.(); } catch {}
+  setTimeout(() => clearInterval(sweeper), 60000).unref?.();
+  // Give the listening socket a moment to release, so the new copy binds on the
+  // first try. If it still races, the bind retry (every 5s) picks it up.
+  await new Promise((r) => setTimeout(r, 300));
+  try {
+    await mod.default.setup({});
+  } catch (e) {
+    log(`hot reload: the new copy failed to start: ${e?.stack || e}`);
+    return false;
+  }
+  return true;
+}
+
 export default {
   id: "fasfas-proxy",
   async setup(ctx) {
@@ -1906,7 +2000,9 @@ export default {
 // Runs as a standalone daemon (`node index.js`, `bun index.js`) as well as a plugin.
 const invokedDirectly = import.meta.main === true ||
   (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url));
-if (invokedDirectly) {
+// A hot reload re-imports this file; the flag stops that copy from also starting
+// itself as a standalone server (hotReload starts it through setup()).
+if (invokedDirectly && !globalThis.__fasfasHotReloading) {
   startServer(Number(process.env.FASFAS_PROXY_PORT) || PORT_DEFAULT, "standalone")
     .catch((e) => log(`startServer failed: ${e?.stack || e}`));
 }

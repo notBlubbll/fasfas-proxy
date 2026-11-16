@@ -167,6 +167,11 @@ const mockPort = await listen(mock);
 
 // ---------- proxy under test ----------
 const proxyPort = 17000 + Math.floor(Math.random() * 900);
+// A crashed suite must not leave its proxy running: a stray copy holding the
+// port makes the next run talk to old code.
+process.on("exit", () => { try { proxy.kill(); } catch {} });
+process.on("uncaughtException", (e) => { console.error(e); process.exit(1); });
+
 const proxy = spawn(process.execPath, [path.join(ROOT, "index.js")], {
   env: {
     ...process.env,
@@ -664,6 +669,52 @@ log("\nlive sessions decide placement, pins follow their key");
   await as("ses_remap");
   ok("and the session keeps the same credential", seen[seen.length - 1].auth === "Bearer sk-load-bbbb2222", seen[seen.length - 1].auth);
   ok("a session on the removed key loses its pin", after.pins.ses_live1 === undefined, JSON.stringify(after.pins));
+  await api({ keys: [] });
+}
+
+log("\nhot reload without a service restart");
+{
+  const api = (b) => fetch(`${base}/keys`, { method: "POST", body: JSON.stringify(b) }).then((x) => x.json());
+  await api({ keys: ["sk-reload-aaaa1111"] });
+  await api({ pin: { session: "ses_reload", key: 1 } });
+  const usageBefore = (await (await fetch(`${base}/usage`)).json()).windows.all.requests;
+  const before = await (await fetch(`${base}/status`)).json();
+  const up0 = before.uptimeMs;
+  const inst0 = before.instance;
+
+  const denied = await fetch(`${base}/admin/reload`, { method: "POST" });
+  ok("the reload needs the admin header", denied.status === 403, String(denied.status));
+
+  // A request that is mid-flight when the reload starts must still finish.
+  const slow = fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock-slow", messages: [{ role: "user", content: "work" }] }),
+  }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  await sleep(200);
+
+  const r = await fetch(`${base}/admin/reload`, { method: "POST", headers: { "x-fasfas-admin": "1" } });
+  ok("the reload is accepted", r.status === 200 && (await r.json()).reloading === true);
+
+  const done = await slow;
+  ok("a request in flight during the reload still completes", done.status === 200 && done.body.choices?.[0]?.message?.content === "slow done", JSON.stringify(done).slice(0, 120));
+
+  let back = false;
+  for (let i = 0; i < 40 && !back; i++) {
+    try { back = (await fetch(`${base}/healthz`)).ok; } catch {}
+    if (!back) await sleep(250);
+  }
+  ok("the proxy answers on the same port afterwards", back);
+
+  const st = await (await fetch(`${base}/status`)).json();
+  ok("it is a fresh copy of the code (uptime restarted)", st.instance && st.instance !== inst0 && st.uptimeMs < 8000,
+    `instance ${inst0} -> ${st.instance}, uptime ${up0} -> ${st.uptimeMs}`);
+
+  const k = await (await fetch(`${base}/keys`)).json();
+  ok("keys and pins survive the reload", k.keys.length === 1 && k.pins.ses_reload === 1, JSON.stringify({ keys: k.keys.length, pins: k.pins }));
+  const usageAfter = (await (await fetch(`${base}/usage`)).json()).windows.all.requests;
+  ok("usage history survives the reload", usageAfter >= usageBefore, `${usageBefore} -> ${usageAfter}`);
+
   await api({ keys: [] });
 }
 

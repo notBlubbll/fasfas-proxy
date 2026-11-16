@@ -229,6 +229,29 @@ compaction handoff model=glm-5.3-flash status=200 finish=stop bytes=4821
 Normal tool-carrying requests are never buffered or rerouted, so streaming latency
 is unchanged outside compaction.
 
+## Keys
+
+The gateway meters each key on its own, so a second key is a second set of
+per-model windows. Keys are added in the panel's **Keys** section and stored in
+`keys.json` next to the plugin (never in the repo, never in `opencode.json`,
+which keeps one credential only as the fallback).
+
+- **One session is one key.** A session is pinned to a key the first time it is
+  seen, and every request it makes is charged to that key's windows and no other.
+  There is no round-robin and no borrowing: a session on key 1 never spends
+  key 2's budget.
+- **New sessions take the key with fewer live sessions.** "Live" means seen in the
+  last 30 minutes; sessions that ended hours ago do not count as load. Pins are
+  forgotten after 14 days.
+- **Pins follow their key.** Removing key 1 shifts key 2 down, and its sessions go
+  with it. Sessions that were on the removed key are placed again on their next
+  request.
+- **Totals scale with keys.** `/status` and the panel report the per-key cap times
+  the number of keys, so one key shows the original numbers and two show double.
+- The panel lists live sessions with their title, key and running/idle state, and
+  each key row has **Show**, **Edit**, **Pin** (glue the open session to it) and
+  **×**.
+
 ## Configuration
 
 | Env var | Default | Meaning |
@@ -255,6 +278,16 @@ closing it, so a reload cannot kill streams that are mid-turn.
 ## Endpoints
 
 - `GET /healthz` → `fasfas-proxy OK`
+- `POST /admin/reload` (header `x-fasfas-admin: 1`) → swaps in the current
+  `index.js` without restarting the OpenCode service. The new file is loaded
+  first, so a broken edit leaves the running proxy untouched. Requests already in
+  flight finish on the old code. Keys, pins and usage history carry over; the
+  in-memory rate windows start empty.
+- `GET /keys` → masked keys, live session counts per key, the pins, and every
+  session seen in the last 30 minutes with its key, state and last model.
+  `POST /keys` takes `{"add":…}`, `{"set":n,"key":…}`, `{"remove":n}` or
+  `{"pin":{"session":…,"key":n}}`. `GET /keys/reveal?slot=n` returns one full key
+  to a local client only, and refuses browser origins.
 - `GET /status` → limits, vision config, compaction config, per-model counters
   (`total`, `throttled`, `retries`, `tokensUsed`), CORS enabled, `no-store`
 - `GET /usage` → per-model totals for `24h`, `7d`, `30d`, `all`:
@@ -266,7 +299,9 @@ closing it, so a reload cannot kill streams that are mid-turn.
   "models": {
     "24h": {
       "sonnet-5.5": { "requests": 111, "input": 4578856, "output": 31554, "reasoning": 0,
-                      "cached": 0, "avgTps": 0, "avgMs": 0, "cost": 9.473252, "seeded": 1 }
+                      "cached": 0, "cachedPct": 0.4, "inputReal": 147328380,
+                      "avgTps": 0, "meanTps": 0, "medTps": 0, "lastTps": 0, "tpsN": 0,
+                      "ttftMs": 0, "ttftN": 0, "avgMs": 0, "cost": 9.473252, "seeded": 1 }
     }
   },
   "lifetime": { "sonnet-5.5": { "requests": 111, "input": 4578856, "output": 31554 } }
@@ -276,6 +311,21 @@ closing it, so a reload cannot kill streams that are mid-turn.
 Costs bill cached tokens at the cached-read rate instead of the input rate.
 Records live in `.fasfas-usage.jsonl` (30-day retention) and lifetime totals in
 `.fasfas-usage.json`.
+
+**How the speed numbers are measured**
+
+- **tok/s** is decode speed. The clock starts at the first streamed frame that
+  carries model text (not the first byte), and stops at the last one. Output
+  tokens after the first are divided by that window. The panel's average is
+  token-weighted: all measured tokens over all measured time. The tooltip also
+  shows the mean and median of the per-request rates, and the latest one.
+  Replies under 16 tokens, replies that arrive in one frame, and non-streamed
+  replies are left out, because their timing is noise.
+- **TTFT** is time to first token: request sent to the first text frame.
+- **cached %** is cached ÷ input, from requests the proxy carried. Imported
+  history has no cache data and is left out. Claude models (haiku, sonnet) only
+  cache when requests carry `cache_control`, which the example config enables with
+  `compatibility.cacheFormat: "anthropic"`. DeepSeek and GLM cache automatically.
 
 ### Seeding history
 
