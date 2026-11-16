@@ -755,7 +755,12 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     table.appendChild(thead);
 
     const body = document.createElement("tbody");
-    const models = (data.models && data.models[win]) || {};
+    // Every model the proxy knows a price for gets a row, so a model that has not
+    // been used in this window still shows up (with zeros) instead of being absent.
+    const models = Object.assign({}, (data.models && data.models[win]) || {});
+    for (const name of Object.keys(data.pricing || {})) {
+      if (!models[name]) models[name] = { requests: 0, input: 0, output: 0, reasoning: 0, cost: 0 };
+    }
     const rows = Object.entries(models).sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0) || (b[1].output || 0) - (a[1].output || 0));
     for (const [name, m] of rows) {
       const tr = document.createElement("tr");

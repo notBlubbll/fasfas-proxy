@@ -259,6 +259,8 @@ which keeps one credential only as the fallback).
   serving overflow from another. Each key row has **Show**, **Edit**, **Pin** (glue the open session to it) and
   **×**.
 
+The provider's `apiKey` in OpenCode only has to be non-empty once keys are in the panel's Keys section: the proxy replaces the inbound credential with the pooled key for the session. The example uses `{env:FASFAS_API_KEY}`; any placeholder works.
+
 ## Configuration
 
 | Env var | Default | Meaning |

@@ -87,6 +87,11 @@ const PRICING_DEFAULT = {
   "haiku-5.5": { in: 0.10, out: 0.50, cached: 0.01 },
   "sonnet-5.5": { in: 2.00, out: 10.00, cached: 0.10 },
   "qwen3.8-27b": { in: 0.15, out: 0.47, cached: 0.016 },
+  // OpenCode Go table. The gateway lists it at $0, like its other models.
+  "glm-5.2": { in: 1.40, out: 4.40, cached: 0.26 },
+  // Image generation is not billed per token here.
+  "mai-image-2.6-flash": { in: 0, out: 0, cached: 0 },
+  "mai-image-2.6": { in: 0, out: 0, cached: 0 },
 };
 
 function parsePricing(src) {
@@ -1576,6 +1581,11 @@ async function handle(req, res) {
       if (result.done) {
         reconcileTokens(reservation, estTokens, result.bytes);
         recordUsage(model, result, Date.now() - started);
+        // Image generation replies carry no token usage: count the request so the
+        // model shows up in the usage table.
+        if (model && result.status === 200 && url.pathname.includes("/images/generations")) {
+          appendUsageRecord({ t: Date.now(), m: model, i: 0, o: 0, r: 0, c: 0, gm: 0, ttft: 0, sr: 0, ms: Math.max(0, Math.round(Date.now() - started)) });
+        }
         return;
       }
       if (result.visionFallback) {
