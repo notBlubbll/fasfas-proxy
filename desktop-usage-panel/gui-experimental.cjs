@@ -267,8 +267,117 @@ function buildPanel(endpoint, refreshMs, headingText) {
   }
   pingBtn.onclick = ping;
 
+  // ---- keys ---------------------------------------------------------------
+  // The gateway meters each key separately, so a second key is a second set of
+  // per-model windows. Stored next to the plugin, never in opencode.json.
+  const keysUrl = endpoint.replace(/\/usage\/?$/, "/keys");
+  const keyBox = document.createElement("div");
+  keyBox.style.cssText = "border-top:" + BORDER + ";padding-top:10px;display:flex;flex-direction:column;gap:6px";
+
+  const keyHead = document.createElement("div");
+  keyHead.textContent = "Keys";
+  keyHead.style.cssText = "font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;opacity:.55";
+  keyBox.appendChild(keyHead);
+
+  const keyList = document.createElement("div");
+  keyList.style.cssText = "display:flex;flex-direction:column;gap:3px";
+  keyBox.appendChild(keyList);
+
+  const keyEdit = document.createElement("div");
+  keyEdit.style.cssText = "display:flex;gap:6px;align-items:center";
+
+  const keyInput = document.createElement("input");
+  keyInput.type = "password";
+  keyInput.placeholder = "paste a key to add…";
+  keyInput.style.cssText = [
+    "flex:1", "min-width:0", "padding:4px 8px", "border-radius:7px",
+    "border:1px solid rgba(127,127,127,.35)", "background:transparent", "color:inherit", "font:inherit",
+  ].join(";");
+
+  const keyAdd = document.createElement("button");
+  keyAdd.type = "button";
+  keyAdd.textContent = "Add";
+  keyAdd.style.cssText = [
+    "padding:4px 10px", "border-radius:7px", "border:1px solid rgba(127,127,127,.35)",
+    "background:rgba(127,127,127,.08)", "color:inherit", "cursor:pointer", "font:inherit", "font-weight:600",
+  ].join(";");
+
+  keyEdit.appendChild(keyInput);
+  keyEdit.appendChild(keyAdd);
+  keyBox.appendChild(keyEdit);
+
+  const keyNote = document.createElement("div");
+  keyNote.style.cssText = "opacity:.5;font-size:11px";
+  keyNote.textContent = "saved to .fasfas-keys.json — each session sticks to one key";
+  keyBox.appendChild(keyNote);
+  root.appendChild(keyBox);
+
+  function renderKeys() {
+    keyList.textContent = "";
+    if (!keys.length) {
+      const empty = document.createElement("div");
+      empty.textContent = "no keys — the credential OpenCode sends is used";
+      empty.style.cssText = "opacity:.5;font-size:11px";
+      keyList.appendChild(empty);
+      return;
+    }
+    for (const k of keys) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:8px;align-items:center";
+
+      const label = document.createElement("span");
+      label.textContent = `#${k.index}  ${k.hint}`;
+      label.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums";
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.textContent = "×";
+      del.title = "Remove this key";
+      del.style.cssText = [
+        "padding:0 7px", "border-radius:6px", "border:1px solid rgba(127,127,127,.3)",
+        "background:transparent", "color:inherit", "cursor:pointer", "font:inherit", "line-height:1.5",
+      ].join(";");
+      del.onclick = () => saveKeys({ remove: k.index });
+
+      row.appendChild(label);
+      row.appendChild(del);
+      keyList.appendChild(row);
+    }
+  }
+
+  async function saveKeys(payload) {
+    keyAdd.disabled = true;
+    try {
+      const r = await fetch(keysUrl, { method: "POST", cache: "no-store", body: JSON.stringify(payload) });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+      keys = j.keys || [];
+      renderKeys();
+      keyNote.textContent = "saved to .fasfas-keys.json — each session sticks to one key";
+    } catch (e) {
+      keyNote.textContent = "key update failed: " + ((e && e.message) || "unreachable");
+    } finally {
+      keyAdd.disabled = false;
+    }
+  }
+
+  keyAdd.onclick = () => {
+    const v = keyInput.value.trim();
+    if (!v) return;
+    keyInput.value = "";
+    saveKeys({ add: v });
+  };
+  keyInput.onkeydown = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      keyAdd.onclick();
+    }
+  };
+  renderKeys();
+
   let data = null;
   let error = null;
+  let keys = [];
   // Live slot usage per model: used requests in the current window vs the cap.
   let slots = {};
 
@@ -411,13 +520,21 @@ function buildPanel(endpoint, refreshMs, headingText) {
     refreshBtn.style.opacity = ".45";
     refreshBtn.textContent = "…";
     try {
-      const [usageRes, statusRes] = await Promise.all([
+      const [usageRes, statusRes, keysRes] = await Promise.all([
         fetch(endpoint, { cache: "no-store" }),
         fetch(endpoint.replace(/\/usage\/?$/, "/status"), { cache: "no-store" }).catch(() => null),
+        fetch(keysUrl, { cache: "no-store" }).catch(() => null),
       ]);
       if (!usageRes.ok) throw new Error("HTTP " + usageRes.status);
       data = await usageRes.json();
       error = null;
+      if (keysRes && keysRes.ok) {
+        const kj = await keysRes.json();
+        if (Array.isArray(kj.keys)) {
+          keys = kj.keys;
+          renderKeys();
+        }
+      }
 
       // Slot usage for the model column: live limiter state, plus the configured
       // caps so a model with no traffic yet still shows "0/6".

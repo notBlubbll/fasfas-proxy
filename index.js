@@ -511,53 +511,137 @@ function parseOverflow(src) {
 
 const OVERFLOW = parseOverflow(process.env.FASFAS_PROXY_OVERFLOW || "");
 const overflowStats = new Map(); // from -> { to, count }
+// Overflow traffic that is in flight right now: target -> { count, from: Set }.
+// The panel marks those models with a * while they are serving someone else's
+// requests.
+const overflowActive = new Map();
+
+function markOverflowActive(target, from) {
+  const e = overflowActive.get(target) || { count: 0, from: new Set() };
+  e.count++;
+  e.from.add(from);
+  overflowActive.set(target, e);
+}
+
+function clearOverflowActive(target, from) {
+  const e = overflowActive.get(target);
+  if (!e) return;
+  e.count = Math.max(0, e.count - 1);
+  if (e.count === 0) {
+    e.from.delete(from);
+    if (e.from.size === 0) overflowActive.delete(target);
+  }
+}
+
+// ---- key pool ---------------------------------------------------------------
+// The gateway meters each key separately, so a second key means a second set of
+// per-model windows. Keys are added from the panel and stored next to the
+// plugin; an OpenCode session sticks to one key (hash of its id) so its prompt
+// cache stays warm, while session-less requests round-robin.
+const KEYS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".fasfas-keys.json");
+const MAX_KEYS = 8;
+const CORS_HEADERS = { "cache-control": "no-store", "access-control-allow-origin": "*" };
+let keyPool = [];
+let keyCursor = 0;
+
+function loadKeys() {
+  let fromFile = [];
+  try {
+    const j = JSON.parse(fs.readFileSync(KEYS_FILE, "utf8"));
+    if (Array.isArray(j.keys)) fromFile = j.keys;
+  } catch {}
+  const fromEnv = String(process.env.FASFAS_PROXY_KEYS || "").split(",");
+  keyPool = [...new Set([...fromEnv, ...fromFile].map((k) => String(k || "").trim()).filter(Boolean))].slice(0, MAX_KEYS);
+}
+
+function saveKeys() {
+  try {
+    fs.writeFileSync(KEYS_FILE, JSON.stringify({ keys: keyPool }, null, 2) + "\n", "utf8");
+    try { fs.chmodSync(KEYS_FILE, 0o600); } catch {}
+  } catch (e) {
+    log(`could not save keys: ${e?.message || e}`);
+  }
+}
+
+function maskKey(k) {
+  const s = String(k || "");
+  return s.length <= 4 ? "…" : "…" + s.slice(-4);
+}
+
+// Sticky per session, round-robin otherwise. Returns null when no pool is set,
+// which leaves the inbound credential untouched.
+function pickKey(sessionId) {
+  if (keyPool.length === 0) return null;
+  if (sessionId) {
+    let h = 0;
+    for (let i = 0; i < sessionId.length; i++) h = (h * 31 + sessionId.charCodeAt(i)) >>> 0;
+    return keyPool[h % keyPool.length];
+  }
+  const key = keyPool[keyCursor % keyPool.length];
+  keyCursor = (keyCursor + 1) % keyPool.length;
+  return key;
+}
+
+function keysReport() {
+  return {
+    keys: keyPool.map((k, i) => ({ index: i + 1, hint: maskKey(k) })),
+    max: MAX_KEYS,
+    file: KEYS_FILE,
+    header: "Authorization: Bearer <key>",
+  };
+}
 
 // ---- manual model ping -----------------------------------------------------
 // POST /ping sends one tiny prompt to each model, so the panel can show which
-// model is alive and what it calls itself. Pings go through the same limiters
-// as real traffic; a model with no free slot within PING_MAX_WAIT_MS is reported
-// as skipped rather than holding the button for a whole window.
+// model is alive and what it calls itself. Pings obey the same limiters as real
+// traffic, requests and tokens both: a ping waits for a free slot instead of
+// jumping the queue, and it is only skipped if the wait would outlast any window
+// (three minutes).
 const PING_PROMPT = "State the model you are and reply in exactly this form: I run <model name>, pong";
-const PING_MAX_WAIT_MS = 5000;
+const PING_MAX_WAIT_MS = Number(process.env.FASFAS_PROXY_PING_WAIT_MS) || 180000;
 let lastAuthHeader = null; // most recent gateway credential seen on a real request
 
-async function pingModels(models, auth) {
-  const results = [];
-  for (const model of models) {
-    const started = Date.now();
-    const estTokens = Math.ceil((PING_PROMPT.length + 64) / 4);
-    const lim = limiterFor(model);
-    let reservation = null;
+async function pingModel(model, auth) {
+  const started = Date.now();
+  // Include the reply budget so the token reservation cannot push a window over
+  // its cap: the limiter sees prompt + max_tokens up front.
+  const estTokens = Math.ceil((PING_PROMPT.length + 64) / 4) + 60;
+  const lim = limiterFor(model);
+  let reservation = null;
+  let queueMs = 0;
 
-    if (lim) {
-      PROXY_STATE.queued++;
-      try { reservation = await acquire(model, estTokens, PING_MAX_WAIT_MS); } finally { PROXY_STATE.queued--; }
-      if (reservation && reservation.spill) {
-        const waitMs = lim.waitTime(Date.now(), estTokens);
-        results.push({ model, ok: false, skipped: true, ms: Date.now() - started, error: `rate limited, next slot in ${Math.ceil(waitMs / 1000)}s` });
-        continue;
-      }
-    }
-
-    try {
-      const payload = { model, stream: false, max_tokens: 60, messages: [{ role: "user", content: PING_PROMPT }] };
-      const res = await postJson("/chat/completions", { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) }, payload, 60000);
-      const ms = Date.now() - started;
-      if (res.status >= 400) {
-        results.push({ model, ok: false, ms, error: `HTTP ${res.status}: ${res.text.replace(/\s+/g, " ").slice(0, 140)}` });
-        continue;
-      }
-      const j = JSON.parse(res.text);
-      const text = (j?.choices?.[0]?.message?.content || "").trim();
-      const u = parseUsageFromText(res.text);
-      if (u) appendUsageRecord({ t: Date.now(), m: model, i: u.prompt, o: u.completion, r: u.reasoning, c: u.cached, gm: ms, ms });
-      reconcileTokens(reservation, estTokens, Buffer.byteLength(res.text));
-      results.push({ model, ok: true, ms, text });
-    } catch (e) {
-      results.push({ model, ok: false, ms: Date.now() - started, error: String(e?.message || e) });
+  if (lim) {
+    PROXY_STATE.queued++;
+    try { reservation = await acquire(model, estTokens, PING_MAX_WAIT_MS); } finally { PROXY_STATE.queued--; }
+    queueMs = Date.now() - started;
+    if (reservation && reservation.spill) {
+      const waitMs = lim.waitTime(Date.now(), estTokens);
+      return { model, ok: false, skipped: true, queueMs, ms: Date.now() - started, error: `no free slot within ${Math.round(PING_MAX_WAIT_MS / 1000)}s, next in ${Math.ceil(waitMs / 1000)}s` };
     }
   }
-  return results;
+
+  try {
+    const payload = { model, stream: false, max_tokens: 60, messages: [{ role: "user", content: PING_PROMPT }] };
+    const res = await postJson("/chat/completions", { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) }, payload, 60000);
+    const ms = Date.now() - started;
+    if (res.status >= 400) {
+      return { model, ok: false, queueMs, ms, error: `HTTP ${res.status}: ${res.text.replace(/\s+/g, " ").slice(0, 140)}` };
+    }
+    const j = JSON.parse(res.text);
+    const text = (j?.choices?.[0]?.message?.content || "").trim();
+    const u = parseUsageFromText(res.text);
+    if (u) appendUsageRecord({ t: Date.now(), m: model, i: u.prompt, o: u.completion, r: u.reasoning, c: u.cached, gm: Math.max(0, ms - queueMs), ms });
+    reconcileTokens(reservation, estTokens, Buffer.byteLength(res.text));
+    return { model, ok: true, queueMs, ms, text };
+  } catch (e) {
+    return { model, ok: false, queueMs, ms: Date.now() - started, error: String(e?.message || e) };
+  }
+}
+
+// One limiter per model, so the models are pinged concurrently and a busy model
+// only delays its own row.
+async function pingModels(models, auth) {
+  return Promise.all(models.map((m) => pingModel(m, auth)));
 }
 
 // ---- vision handoff --------------------------------------------------------
@@ -920,15 +1004,54 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/healthz") {
     return send(res, 200, "text/plain", "fasfas-proxy OK\n");
   }
+  if (url.pathname === "/keys") {
+    if (req.method === "GET") {
+      return send(res, 200, "application/json", JSON.stringify(keysReport(), null, 2) + "\n", CORS_HEADERS);
+    }
+    if (req.method === "POST") {
+      const raw = await readBody(req);
+      let body = {};
+      try { body = JSON.parse(raw.toString("utf8") || "{}"); } catch {}
+
+      if (Array.isArray(body.keys)) {
+        keyPool = [...new Set(body.keys.map((k) => String(k).trim()).filter(Boolean))].slice(0, MAX_KEYS);
+      } else if (typeof body.add === "string" && body.add.trim()) {
+        const k = body.add.trim();
+        if (keyPool.includes(k)) return sendJson(res, 409, JSON.stringify({ error: "key already configured" }));
+        if (keyPool.length >= MAX_KEYS) return sendJson(res, 409, JSON.stringify({ error: `at most ${MAX_KEYS} keys` }));
+        keyPool.push(k);
+      } else if (Number.isInteger(body.remove) && body.remove >= 1) {
+        keyPool.splice(body.remove - 1, 1);
+      } else {
+        return sendJson(res, 400, JSON.stringify({ error: 'send {"keys":[...]}, {"add":"<key>"} or {"remove":<index>}' }));
+      }
+
+      saveKeys();
+      log(`keys updated: ${keyPool.length} configured (${keyPool.map(maskKey).join(", ") || "none"})`);
+      return send(res, 200, "application/json", JSON.stringify(keysReport(), null, 2) + "\n", CORS_HEADERS);
+    }
+  }
+
   if (req.method === "POST" && url.pathname === "/ping") {
-    const models = [...new Set([
-      ...Object.keys(PRICING),
-      ...[...LIMITS].filter(([k]) => k !== "*").map(([k]) => k),
-    ])].sort();
-    const auth = req.headers.authorization || lastAuthHeader;
-    log(`ping ${models.length} models via POST /ping`);
+    const raw = await readBody(req);
+    let requested = null;
+    try {
+      const parsed = JSON.parse(raw.toString("utf8") || "{}");
+      if (Array.isArray(parsed.models)) requested = parsed.models.filter((m) => typeof m === "string" && m);
+    } catch {}
+
+    const models = requested && requested.length
+      ? [...new Set(requested)]
+      : [...new Set([
+        ...[...LIMITS].filter(([k]) => k !== "*").map(([k]) => k),
+        ...[...TOKEN_LIMITS].filter(([k]) => k !== "*").map(([k]) => k),
+      ])].sort();
+
+    const auth = pickKey(null) || req.headers.authorization || lastAuthHeader;
+    log(`ping ${models.length} model(s) via POST /ping: ${models.join(" ")}`);
     const results = await pingModels(models, auth);
-    return send(res, 200, "application/json", JSON.stringify({ updated: Date.now(), results }, null, 2) + "\n",
+    log(`ping done: ${results.map((r) => `${r.model}=${r.ok ? "ok" : r.skipped ? "skipped" : "fail"}`).join(" ")}`);
+    return send(res, 200, "application/json", JSON.stringify({ updated: Date.now(), prompt: PING_PROMPT, results }, null, 2) + "\n",
       { "cache-control": "no-store", "access-control-allow-origin": "*" });
   }
   if (req.method === "GET" && url.pathname === "/usage") {
@@ -956,6 +1079,7 @@ async function handle(req, res) {
       overflow: {
         rules: Object.fromEntries([...OVERFLOW].map(([k, v]) => [k, `${v.to}:${v.maxWaitMs / 1000}s`])),
         spills: Object.fromEntries(overflowStats),
+        active: Object.fromEntries([...overflowActive].map(([k, v]) => [k, { count: v.count, from: [...v.from] }])),
       },
       sessions: sessionRetryReport(now),
       retries5xx: PROXY_STATE.retries5xx || 0,
@@ -979,12 +1103,17 @@ async function handle(req, res) {
   let model = meta.model;
   const isChat = url.pathname.includes("/chat/completions");
   const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"] || null;
+  // With a key pool configured, this request goes out on the key its session is
+  // pinned to, instead of whatever credential OpenCode sent.
+  const pooledAuth = pickKey(sessionId);
+  if (pooledAuth) req.headers.authorization = `Bearer ${pooledAuth}`;
   const started = Date.now();
 
   log(`req ${req.method} ${url.pathname} model=${model || "-"} stream=${meta.stream} bytes=${body.length} max_tokens=${meta.maxTokens ?? "default"}`);
 
   PROXY_STATE.requests++;
   PROXY_STATE.active++;
+  let spill = null; // { target, from } while this request is served by a fallback
   try {
     if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
     if (isChat && model) {
@@ -1020,7 +1149,10 @@ async function handle(req, res) {
       overflowStats.set(model, stat);
       log(`overflow ${model} -> ${rule.to} (${why})`);
       body = rewriteModel(body, rule.to);
+      const from = model;
       model = rule.to;
+      spill = { target: rule.to, from };
+      markOverflowActive(rule.to, from);
       reservation = null;
       if (limiterFor(model)) {
         PROXY_STATE.queued++;
@@ -1098,6 +1230,7 @@ async function handle(req, res) {
       await sleep(retryMs);
     }
   } finally {
+    if (spill) clearOverflowActive(spill.target, spill.from);
     clearSessionRetry(sessionId);
     PROXY_STATE.active--;
     log(`done ${url.pathname} model=${model || "-"} in ${Date.now() - started}ms`);
@@ -1374,6 +1507,7 @@ function sendJson(res, status, text) {
 
 async function startServer(port, mode) {
   loadUsage();
+  loadKeys();
   const server = createServer();
   server.on("request", (req, res) => {
     handle(req, res).catch((err) => {

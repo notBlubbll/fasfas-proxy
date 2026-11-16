@@ -474,9 +474,9 @@ log("\ntransient 5xx is retried with backoff");
 
 log("\nmanual ping endpoint");
 {
-  const r = await fetch(`${base}/ping`, { method: "POST" });
+  const r = await fetch(`${base}/ping`, { method: "POST", body: JSON.stringify({ models: ["mock-ok", "mock-a"] }) });
   const j = await r.json();
-  ok("ping returns results", Array.isArray(j.results) && j.results.length >= 3, JSON.stringify(j).slice(0, 200));
+  ok("ping returns results", Array.isArray(j.results) && j.results.length === 2, JSON.stringify(j).slice(0, 200));
   const ok2 = j.results.find((p) => p.model === "mock-ok");
   ok("a model answered with text", ok2?.ok === true && typeof ok2.text === "string" && ok2.text.length > 0, JSON.stringify(ok2));
   ok("ping reports latency", typeof ok2?.ms === "number" && ok2.ms >= 0);
@@ -485,6 +485,44 @@ log("\nmanual ping endpoint");
   ok("every result carries a model name", j.results.every((p) => typeof p.model === "string" && p.model.length > 0));
   const st = await (await fetch(`${base}/status`)).json();
   ok("pings are counted as usage", st.requests > 0);
+}
+
+log("\nkey pool");
+{
+  let r = await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ keys: ["sk-test-aaaa1111", "sk-test-bbbb2222"] }) });
+  let j = await r.json();
+  ok("two keys stored", j.keys?.length === 2, JSON.stringify(j));
+  ok("keys come back masked", j.keys.map((k) => k.hint).join(",") === "…1111,…2222", JSON.stringify(j.keys));
+
+  const chat = (headers) => fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer inbound-key", "content-type": "application/json", ...headers },
+    body: JSON.stringify({ model: "mock-a", messages: [{ role: "user", content: "hi" }] }),
+  });
+
+  let before = seen.length;
+  for (let i = 0; i < 2; i++) await chat({}).then((x) => x.text());
+  const auths = seen.slice(before).map((c) => c.auth);
+  ok("session-less requests round-robin the pool",
+    new Set(auths).size === 2 && auths.every((a) => a.startsWith("Bearer sk-test-")),
+    JSON.stringify(auths));
+
+  before = seen.length;
+  for (let i = 0; i < 2; i++) await chat({ "x-opencode-session-id": "ses_pinned" }).then((x) => x.text());
+  const pinned = seen.slice(before).map((c) => c.auth);
+  ok("one session sticks to one key", new Set(pinned).size === 1 && pinned[0].startsWith("Bearer sk-test-"), JSON.stringify(pinned));
+
+  r = await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ remove: 1 }) });
+  j = await r.json();
+  ok("a key can be removed", j.keys?.length === 1, JSON.stringify(j));
+
+  r = await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ keys: [] }) });
+  j = await r.json();
+  ok("an empty pool restores passthrough", j.keys?.length === 0, JSON.stringify(j));
+
+  before = seen.length;
+  await chat({ "x-opencode-session-id": "ses_after" }).then((x) => x.text());
+  ok("inbound credential used again with no pool", seen[seen.length - 1].auth === "Bearer inbound-key", seen[seen.length - 1].auth);
 }
 
 proxy.kill();
