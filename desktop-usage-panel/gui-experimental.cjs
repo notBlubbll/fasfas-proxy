@@ -181,6 +181,92 @@ function buildPanel(endpoint, refreshMs, headingText) {
   footer.style.cssText = "margin-top:auto;padding-top:6px;opacity:.5;font-size:11px";
   root.appendChild(footer);
 
+  // ---- manual ping ---------------------------------------------------------
+  // One tiny prompt per model at the push of a button, to see which models are
+  // alive and what each calls itself.
+  const pingBox = document.createElement("div");
+  pingBox.style.cssText = "border-top:" + BORDER + ";padding-top:10px;display:flex;flex-direction:column;gap:8px";
+
+  const pingRow = document.createElement("div");
+  pingRow.style.cssText = "display:flex;align-items:center;gap:8px";
+
+  const pingBtn = document.createElement("button");
+  pingBtn.type = "button";
+  pingBtn.textContent = "Ping models";
+  pingBtn.style.cssText = [
+    "padding:4px 12px",
+    "border-radius:8px",
+    "border:1px solid rgba(127,127,127,.35)",
+    "background:rgba(127,127,127,.08)",
+    "color:inherit",
+    "cursor:pointer",
+    "font:inherit",
+    "font-weight:600",
+  ].join(";");
+  pingRow.appendChild(pingBtn);
+
+  const pingNote = document.createElement("span");
+  pingNote.textContent = '"state your model and say pong"';
+  pingNote.style.cssText = "opacity:.5;font-size:11px";
+  pingRow.appendChild(pingNote);
+  pingBox.appendChild(pingRow);
+
+  const pingOut = document.createElement("div");
+  pingOut.style.cssText = "display:flex;flex-direction:column;gap:2px;font-variant-numeric:tabular-nums";
+  pingBox.appendChild(pingOut);
+  root.appendChild(pingBox);
+
+  let pingBusy = false;
+  async function ping() {
+    if (pingBusy) return;
+    pingBusy = true;
+    pingBtn.disabled = true;
+    pingBtn.style.opacity = ".55";
+    pingBtn.textContent = "Pinging…";
+    pingOut.textContent = "";
+    const waiting = document.createElement("div");
+    waiting.textContent = "asking every model…";
+    waiting.style.cssText = "opacity:.6";
+    pingOut.appendChild(waiting);
+    try {
+      const r = await fetch(endpoint.replace(/\/usage\/?$/, "/ping"), { method: "POST", cache: "no-store" });
+      const j = await r.json();
+      pingOut.textContent = "";
+      for (const p of j.results || []) {
+        const line = document.createElement("div");
+        line.style.cssText = "display:flex;gap:8px;align-items:baseline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+        const name = document.createElement("span");
+        name.textContent = p.model;
+        name.style.cssText = "flex:0 0 auto;opacity:.65;min-width:130px";
+        const body = document.createElement("span");
+        if (p.ok) {
+          body.textContent = `${(p.text || "").replace(/\s+/g, " ").slice(0, 90)} · ${p.ms}ms`;
+        } else {
+          body.textContent = p.skipped ? `skipped — ${p.error}` : `failed — ${p.error}`;
+          body.style.opacity = ".6";
+        }
+        body.style.cssText += ";overflow:hidden;text-overflow:ellipsis";
+        line.appendChild(name);
+        line.appendChild(body);
+        pingOut.appendChild(line);
+      }
+      // pings are real requests, so refresh the numbers too
+      refresh();
+    } catch (e) {
+      pingOut.textContent = "";
+      const err = document.createElement("div");
+      err.textContent = "ping failed: " + ((e && e.message) || "unreachable");
+      err.style.cssText = "opacity:.6";
+      pingOut.appendChild(err);
+    } finally {
+      pingBusy = false;
+      pingBtn.disabled = false;
+      pingBtn.style.opacity = "1";
+      pingBtn.textContent = "Ping models";
+    }
+  }
+  pingBtn.onclick = ping;
+
   let data = null;
   let error = null;
 

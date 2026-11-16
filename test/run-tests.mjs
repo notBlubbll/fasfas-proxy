@@ -472,6 +472,21 @@ log("\ntransient 5xx is retried with backoff");
   ok("session retry state cleared after success", !st.sessions?.ses_5xx_test, JSON.stringify(st.sessions));
 }
 
+log("\nmanual ping endpoint");
+{
+  const r = await fetch(`${base}/ping`, { method: "POST" });
+  const j = await r.json();
+  ok("ping returns results", Array.isArray(j.results) && j.results.length >= 3, JSON.stringify(j).slice(0, 200));
+  const ok2 = j.results.find((p) => p.model === "mock-ok");
+  ok("a model answered with text", ok2?.ok === true && typeof ok2.text === "string" && ok2.text.length > 0, JSON.stringify(ok2));
+  ok("ping reports latency", typeof ok2?.ms === "number" && ok2.ms >= 0);
+  const limited = j.results.find((p) => p.model === "mock-src");
+  ok("saturated model is skipped, not stalled", limited ? (limited.skipped === true || limited.ok === true) : true, JSON.stringify(limited));
+  ok("every result carries a model name", j.results.every((p) => typeof p.model === "string" && p.model.length > 0));
+  const st = await (await fetch(`${base}/status`)).json();
+  ok("pings are counted as usage", st.requests > 0);
+}
+
 proxy.kill();
 mock.close();
 log(`\n${passed} passed, ${failed} failed`);

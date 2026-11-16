@@ -512,6 +512,54 @@ function parseOverflow(src) {
 const OVERFLOW = parseOverflow(process.env.FASFAS_PROXY_OVERFLOW || "");
 const overflowStats = new Map(); // from -> { to, count }
 
+// ---- manual model ping -----------------------------------------------------
+// POST /ping sends one tiny prompt to each model, so the panel can show which
+// model is alive and what it calls itself. Pings go through the same limiters
+// as real traffic; a model with no free slot within PING_MAX_WAIT_MS is reported
+// as skipped rather than holding the button for a whole window.
+const PING_PROMPT = "State the model you are and reply in exactly this form: I run <model name>, pong";
+const PING_MAX_WAIT_MS = 5000;
+let lastAuthHeader = null; // most recent gateway credential seen on a real request
+
+async function pingModels(models, auth) {
+  const results = [];
+  for (const model of models) {
+    const started = Date.now();
+    const estTokens = Math.ceil((PING_PROMPT.length + 64) / 4);
+    const lim = limiterFor(model);
+    let reservation = null;
+
+    if (lim) {
+      PROXY_STATE.queued++;
+      try { reservation = await acquire(model, estTokens, PING_MAX_WAIT_MS); } finally { PROXY_STATE.queued--; }
+      if (reservation && reservation.spill) {
+        const waitMs = lim.waitTime(Date.now(), estTokens);
+        results.push({ model, ok: false, skipped: true, ms: Date.now() - started, error: `rate limited, next slot in ${Math.ceil(waitMs / 1000)}s` });
+        continue;
+      }
+    }
+
+    try {
+      const payload = { model, stream: false, max_tokens: 60, messages: [{ role: "user", content: PING_PROMPT }] };
+      const res = await postJson("/chat/completions", { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) }, payload, 60000);
+      const ms = Date.now() - started;
+      if (res.status >= 400) {
+        results.push({ model, ok: false, ms, error: `HTTP ${res.status}: ${res.text.replace(/\s+/g, " ").slice(0, 140)}` });
+        continue;
+      }
+      const j = JSON.parse(res.text);
+      const text = (j?.choices?.[0]?.message?.content || "").trim();
+      const u = parseUsageFromText(res.text);
+      if (u) appendUsageRecord({ t: Date.now(), m: model, i: u.prompt, o: u.completion, r: u.reasoning, c: u.cached, gm: ms, ms });
+      reconcileTokens(reservation, estTokens, Buffer.byteLength(res.text));
+      results.push({ model, ok: true, ms, text });
+    } catch (e) {
+      results.push({ model, ok: false, ms: Date.now() - started, error: String(e?.message || e) });
+    }
+  }
+  return results;
+}
+
 // ---- vision handoff --------------------------------------------------------
 // A text-only target that receives image parts cannot see them. Each image is
 // captioned with the vision model, the image part is replaced by the caption
@@ -858,8 +906,30 @@ function readRequest(body) {
 async function handle(req, res) {
   const url = new URL(req.url, `http://${LISTEN_HOST}`);
 
+  // CORS preflight for the panel's POST /ping.
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "content-type",
+      "access-control-max-age": "600",
+    });
+    return res.end();
+  }
+
   if (req.method === "GET" && url.pathname === "/healthz") {
     return send(res, 200, "text/plain", "fasfas-proxy OK\n");
+  }
+  if (req.method === "POST" && url.pathname === "/ping") {
+    const models = [...new Set([
+      ...Object.keys(PRICING),
+      ...[...LIMITS].filter(([k]) => k !== "*").map(([k]) => k),
+    ])].sort();
+    const auth = req.headers.authorization || lastAuthHeader;
+    log(`ping ${models.length} models via POST /ping`);
+    const results = await pingModels(models, auth);
+    return send(res, 200, "application/json", JSON.stringify({ updated: Date.now(), results }, null, 2) + "\n",
+      { "cache-control": "no-store", "access-control-allow-origin": "*" });
   }
   if (req.method === "GET" && url.pathname === "/usage") {
     return send(res, 200, "application/json", JSON.stringify(usageReport(), null, 2) + "\n",
@@ -916,6 +986,7 @@ async function handle(req, res) {
   PROXY_STATE.requests++;
   PROXY_STATE.active++;
   try {
+    if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
     if (isChat && model) {
       body = await visionHandoff(body, model, req.headers.authorization);
       const after = readRequest(body);
