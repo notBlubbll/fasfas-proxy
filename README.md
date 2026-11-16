@@ -34,26 +34,35 @@ on a different model instead of killing the turn.
 | --- | --- | --- | --- | --- | --- | --- |
 | `deepseek-v4.1-flash` | 1,048,576 | 65,536 | ✅ native | yes | 40 | 2,000,000 |
 | `glm-5.3-flash` | 1,048,576 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
-| `glm-5.2` | 1,048,576 | 65,536 | ✅ native | yes | 10 | 1,000,000 |
+| `glm-5.2` | 1,048,576 | 65,536 | not tested | yes | 10 | 1,000,000 |
 | `haiku-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
 | `sonnet-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 6 | 1,000,000 |
 | `qwen3.8-27b` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 3,000,000 |
+
+Image generation (`POST /v1/images/generations`), passed through and counted in the
+usage table, with no request or token limits on the gateway:
+
+| Model | Notes |
+| --- | --- |
+| `mai-image-2.6-flash` | faster, lower cost |
+| `mai-image-2.6` | full quality |
 
 > The limits are **per key**: the gateway's real caps, as shown on each key's
 > dashboard. The account total is the per-key cap × the number of configured
 > keys, so two keys double what `/status` and the panel report. One key shows the
 > original numbers.
 
-- `mai-image-2.6` and `mai-image-2.6-flash` are image generation
-  (`POST /v1/images/generations`), passed through and counted, with no token
-  limits.
+- The MAI image models are listed in `opencode.fasfas.json`, but OpenCode's
+  `experimental_image_generate` tool does not offer them (it only lists image
+  models from its own catalog). Call the endpoint directly.
 - All the chat models speak tools, streaming and `reasoning_effort`, and expose the variants
   `low` / `medium` / `high` / `xhigh` / `max`.
-- **The limits are per model, not shared.** The aggregate ceiling is 106 req/min
-  and 10M tok/min, reached only by running every model at once; saturating one
+- **The limits are per model, not shared.** The aggregate ceiling is 116 req/min
+  and 11M tok/min, reached only by running every model at once; saturating one
   model leaves the others untouched.
-- **Images are passed through untouched.** All five models see images natively
-  (verified: haiku and sonnet name all four quadrants of a 64×64 image), so the
+- **Images are passed through untouched.** The other chat models see images natively
+  (verified: haiku and sonnet name all four quadrants of a 64×64 image; `glm-5.2`
+  is not tested), so the
   proxy only captions an image when the upstream actually rejects it.
 - `sonnet-5.5` is the scarcest at 6 requests/minute per key (12 with two keys).
   Point subagents at `deepseek-v4.1-flash` (40/min per key) rather than letting a
@@ -95,7 +104,7 @@ cp -r desktop-usage-panel ~/.config/opencode/plugins/fasfas-usage   # optional p
 ```
 
 OpenCode discovers plugins there on start — no config entry required. Then point
-the provider at the proxy. A complete provider block with all five models,
+the provider at the proxy. A complete provider block with all the models,
 limits, capabilities and variants is in
 [`opencode.fasfas.json`](./opencode.fasfas.json), which contains **no keys**:
 
