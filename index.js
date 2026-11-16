@@ -615,7 +615,36 @@ const overflowStats = new Map(); // from -> { to, count }
 // requests.
 const overflowActive = new Map();
 
+// Spills that landed on a target within the last rate window. A spilled request
+// is often over in seconds, so "in flight" alone would make the * flicker; the
+// window count says how many of the slots the target shows as used came from
+// another model's overflow.
+const OVERFLOW_RECENT_MS = 60000;
+const overflowRecent = new Map(); // target -> [{ t, from }]
+
+function overflowReport(now) {
+  const out = {};
+  for (const [target, list] of overflowRecent) {
+    const keep = list.filter((x) => now - x.t < OVERFLOW_RECENT_MS);
+    if (keep.length) overflowRecent.set(target, keep); else overflowRecent.delete(target);
+  }
+  const targets = new Set([...overflowRecent.keys(), ...overflowActive.keys()]);
+  for (const target of targets) {
+    const recent = overflowRecent.get(target) || [];
+    const live = overflowActive.get(target);
+    out[target] = {
+      count: Math.max(recent.length, live ? live.count : 0),
+      inFlight: live ? live.count : 0,
+      from: [...new Set([...recent.map((x) => x.from), ...(live ? live.from : [])])],
+    };
+  }
+  return out;
+}
+
 function markOverflowActive(target, from) {
+  const list = overflowRecent.get(target) || [];
+  list.push({ t: Date.now(), from });
+  overflowRecent.set(target, list);
   const e = overflowActive.get(target) || { count: 0, from: new Set() };
   e.count++;
   e.from.add(from);
@@ -1395,7 +1424,9 @@ async function handle(req, res) {
       overflow: {
         rules: Object.fromEntries([...OVERFLOW].map(([k, v]) => [k, `${v.to}:${v.maxWaitMs / 1000}s`])),
         spills: Object.fromEntries(overflowStats),
-        active: Object.fromEntries([...overflowActive].map(([k, v]) => [k, { count: v.count, from: [...v.from] }])),
+        // target -> spills in the last minute (count), how many are still running
+        // (inFlight) and which models they came from
+        active: overflowReport(now),
       },
       sessions: sessionRetryReport(now),
       retries5xx: PROXY_STATE.retries5xx || 0,

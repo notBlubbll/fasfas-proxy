@@ -496,6 +496,10 @@ log("\noverflow: a saturated model spills to the fallback");
   ok("status lists the rules", st.overflow?.rules?.["mock-src"] === "mock-dst:0.5s", JSON.stringify(st.overflow?.rules));
   ok("status counts the spills", st.overflow?.spills?.["mock-src"]?.count >= 1 && st.overflow?.spills?.["mock-429"]?.count >= 1, JSON.stringify(st.overflow?.spills));
 
+  const act = st2 => st2.overflow?.active?.["mock-dst"];
+  const a0 = act(st);
+  ok("status counts spills that landed on the target in the last minute", a0 && a0.count >= 2 && a0.from.includes("mock-src"), JSON.stringify(a0));
+
   // A spilled session shows the model that served it, and where it came from.
   const sid = "ses_spill_model";
   await fetch(`${base}/v1/chat/completions`, {

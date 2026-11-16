@@ -251,7 +251,7 @@ which keeps one credential only as the fallback).
 - The panel lists live sessions as a table: session, key, model, state and request
   count. A session whose request overflowed shows the model that served it with a
   `*` (the tooltip names the model it was meant for), and the main table marks a
-  model with `*` while it is serving overflow from another. Each key row has **Show**, **Edit**, **Pin** (glue the open session to it) and
+  model with `*N` (N = requests that overflowed onto it in the last minute) while it is serving overflow from another. Each key row has **Show**, **Edit**, **Pin** (glue the open session to it) and
   **×**.
 
 ## Configuration

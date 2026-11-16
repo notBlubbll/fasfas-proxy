@@ -651,8 +651,11 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     // `*` while this model is serving requests that overflowed from another one.
     const spill = overflowActive[name];
     const label = document.createElement("span");
-    label.textContent = name + (spill ? " *" : "");
-    if (spill) label.title = `serving overflow from ${spill.from.join(", ")} (${spill.count} in flight)`;
+    label.textContent = name + (spill ? ` *${spill.count}` : "");
+    if (spill) {
+      label.title = `${spill.count} of the used slots in the last minute came from ${spill.from.join(", ")} overflowing here` +
+        (spill.inFlight ? ` (${spill.inFlight} still running)` : "");
+    }
 
     el.textContent = "";
     el.appendChild(tag);
