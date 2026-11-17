@@ -698,6 +698,29 @@ log("\nlive sessions decide placement, pins follow their key");
   await api({ keys: [] });
 }
 
+log("\nold images are dropped when a body is over the gateway limit");
+{
+  // three ~4.5 MB screenshots: the oldest must go, the newest must stay
+  const img = (n) => ({ type: "image_url", image_url: { url: "data:image/png;base64," + "A".repeat(4.5e6) + n } });
+  const payload = { model: "mock-ok", messages: [
+    { role: "user", content: [{ type: "text", text: "one" }, img(1)] },
+    { role: "user", content: [{ type: "text", text: "two" }, img(2)] },
+    { role: "user", content: [{ type: "text", text: "three" }, img(3)] },
+  ] };
+  const before = seen.length;
+  await sleep(1100);
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  ok("the request still succeeds", r.status === 200, String(r.status));
+  const sent = String(seen[seen.length - 1]?.raw ?? JSON.stringify(seen[seen.length - 1]?.body));
+  const fwdImages = (sent.match(/"type":"image_url"/g) || []).length;
+  ok("the forwarded body is under the 10 MB trigger", sent.length < 10 * 1024 * 1024 && seen.length > before, `${sent.length} bytes`);
+  ok("oldest image replaced by a note, newest kept", sent.includes("removed to keep the request") && sent.includes("A".repeat(10) + "3") && fwdImages === 2, `image parts: ${fwdImages}`);
+}
+
 log("\nhot reload without a service restart");
 {
   const api = (b) => fetch(`${base}/keys`, { method: "POST", body: JSON.stringify(b) }).then((x) => x.json());

@@ -1527,6 +1527,7 @@ async function handle(req, res) {
   if (sessionAct) sessionAct.active++;
   try {
     if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
+    if (isChat && body.length > IMAGE_SHRINK_TRIGGER) body = shrinkOldImages(body);
     if (isChat && model) {
       body = await visionHandoff(body, model, req.headers.authorization, false, keySlot);
       const after = readRequest(body);
@@ -1791,6 +1792,34 @@ async function deferWhileBusy(model) {
   }
   const waited = Date.now() - t0;
   if (waited > 500) log(`deferred compaction ${model} ${(waited / 1000).toFixed(1)}s until in-flight requests settled`);
+}
+
+// The gateway refuses bodies over 12 MB (413 request_too_large). OpenCode reads
+// that refusal as "too long" and compacts, even when the token count is far under
+// the window. Long sessions with screenshots hit the byte limit first, so when a
+// body is over the trigger the oldest images are replaced with a short note, until
+// it is under the target. The newest images are kept.
+const IMAGE_SHRINK_TRIGGER = Math.round((Number(process.env.FASFAS_PROXY_IMAGE_SHRINK_MB) || 10) * 1024 * 1024);
+const IMAGE_SHRINK_TARGET = Math.round(IMAGE_SHRINK_TRIGGER * 0.9);
+const IMAGE_NOTE = "[image removed to keep the request under the 12 MB gateway limit]";
+
+function shrinkOldImages(body) {
+  let json;
+  try { json = JSON.parse(body.toString("utf8")); } catch { return body; }
+  let size = body.length;
+  let dropped = 0;
+  for (const im of collectImageParts(json)) { // oldest first
+    if (size <= IMAGE_SHRINK_TARGET) break;
+    const content = json.messages[im.mi].content;
+    const before = Buffer.byteLength(JSON.stringify(content[im.pi]), "utf8");
+    content[im.pi] = { type: "text", text: IMAGE_NOTE };
+    size -= before - Buffer.byteLength(JSON.stringify(content[im.pi]), "utf8");
+    dropped++;
+  }
+  if (!dropped) return body;
+  const out = Buffer.from(JSON.stringify(json), "utf8");
+  log(`dropped ${dropped} old image(s) to fit the gateway body limit: ${body.length} -> ${out.length} bytes`);
+  return out;
 }
 
 function rewriteModel(body, model) {
