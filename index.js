@@ -224,7 +224,7 @@ function appendUsageRecord(rec) {
 //   gm   - first -> last text frame (the generation window). Zero when there were
 //          fewer than two text frames, which leaves the request out of tok/s.
 //   ms   - total wall time, kept for latency only.
-function recordUsage(model, result, ms) {
+function recordUsage(model, result, ms, slot = 0) {
   if (!model || !result || result.status !== 200) return;
   const u = parseUsageFromText(result.tail);
   if (!u) return;
@@ -236,6 +236,7 @@ function recordUsage(model, result, ms) {
   appendUsageRecord({
     t: Date.now(),
     m: model,
+    k: slot,
     i: u.prompt,
     o: u.completion,
     r: u.reasoning,
@@ -278,7 +279,8 @@ function pruneUsage() {
 const MIN_TPS_TOKENS = 16;
 const MIN_TPS_WINDOW_MS = 250;
 
-function windowStats(model, since) {
+// slot: only records that were served on that key (1-based); undefined = all keys.
+function windowStats(model, since, slot) {
   const acc = { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, seeded: 0, cost: 0 };
   let realMs = 0, realReq = 0;
   let realIn = 0, realCache = 0;
@@ -289,6 +291,7 @@ function windowStats(model, since) {
   for (const r of usage.records) {
     if (r.t < since) continue;
     if (model && r.m !== model) continue;
+    if (slot !== undefined && (r.k || 0) !== slot) continue;
     acc.requests += r.n || 1;
     acc.input += r.i || 0;
     acc.output += r.o || 0;
@@ -361,6 +364,19 @@ function usageReport() {
     for (const m of names) out.models[key][m] = windowStats(m, since);
   }
   // all-time also includes records pruned from disk, via the lifetime snapshot
+  // Per key, so each key's own spend and traffic can be read. The panel shows the
+  // combined `windows` and `models`; this is for looking at one key.
+  out.perKey = {};
+  for (const [key, since] of Object.entries(windows)) {
+    const slots = new Set(usage.records.filter((r) => r.t >= since).map((r) => r.k || 0));
+    out.perKey[key] = {};
+    for (const k of slots) {
+      const models = {};
+      const names = new Set(usage.records.filter((r) => r.t >= since && (r.k || 0) === k).map((r) => r.m));
+      for (const m of names) models[m] = windowStats(m, since, k);
+      out.perKey[key][k] = { total: windowStats(null, since, k), models };
+    }
+  }
   out.lifetime = usage.lifetime;
   return out;
 }
@@ -1585,11 +1601,11 @@ async function handle(req, res) {
       });
       if (result.done) {
         reconcileTokens(reservation, estTokens, result.bytes);
-        recordUsage(model, result, Date.now() - started);
+        recordUsage(model, result, Date.now() - started, keySlot);
         // Image generation replies carry no token usage: count the request so the
         // model shows up in the usage table.
         if (model && result.status === 200 && url.pathname.includes("/images/generations")) {
-          appendUsageRecord({ t: Date.now(), m: model, i: 0, o: 0, r: 0, c: 0, gm: 0, ttft: 0, sr: 0, ms: Math.max(0, Math.round(Date.now() - started)) });
+          appendUsageRecord({ t: Date.now(), m: model, k: keySlot, i: 0, o: 0, r: 0, c: 0, gm: 0, ttft: 0, sr: 0, ms: Math.max(0, Math.round(Date.now() - started)) });
         }
         return;
       }

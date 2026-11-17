@@ -676,6 +676,10 @@ log("\nlive sessions decide placement, pins follow their key");
     live && live.key === 1 && live.requests >= 1 && live.model === "mock-ok" && live.active === 0, JSON.stringify(live));
   ok("sessions that never ran are not listed", !k.sessions.some((s) => s.id.startsWith("ses_dead_")));
 
+  // usage is recorded per key as well as combined
+  const pk = (await (await fetch(`${base}/usage`)).json()).perKey?.all || {};
+  ok("usage is split per key", pk["1"]?.total.requests >= 1 && pk["2"]?.total.requests >= 1, JSON.stringify(Object.keys(pk)));
+
   // mock-ok is capped at 2 per second: one request is 1/2 for that session
   await sleep(1100);
   await as("ses_limit");
