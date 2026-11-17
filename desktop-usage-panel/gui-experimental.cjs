@@ -186,6 +186,30 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     head.appendChild(b);
   }
 
+  // Key filter next to the window pills: "all" (combined, the default) or one key.
+  let keyView = "all";
+  const keyFilterBox = document.createElement("span");
+  keyFilterBox.style.cssText = "display:inline-flex;gap:4px;margin-left:6px;padding-left:8px;border-left:" + BORDER;
+  head.appendChild(keyFilterBox);
+  function renderKeyFilter() {
+    const ids = ["all", ...keys.map((k) => String(k.index))];
+    if (!ids.includes(keyView)) keyView = "all";
+    keyFilterBox.textContent = "";
+    for (const id of ids) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = id === "all" ? "all keys" : "key " + id;
+      b.style.cssText = [
+        "padding:3px 9px", "border-radius:999px", "border:1px solid rgba(127,127,127,.3)",
+        "background:" + (id === keyView ? "rgba(127,127,127,.22)" : "transparent"),
+        "color:inherit", "cursor:pointer", "font:inherit", "line-height:1.5",
+        "font-weight:" + (id === keyView ? "650" : "400"),
+      ].join(";");
+      b.onclick = () => { keyView = id; paint(); };
+      keyFilterBox.appendChild(b);
+    }
+  }
+
   const refreshBtn = document.createElement("button");
   refreshBtn.type = "button";
   refreshBtn.textContent = "↻";
@@ -740,7 +764,12 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       return;
     }
 
-    const w = data.windows && data.windows[win];
+    renderKeyFilter();
+    // "all keys" is the combined window; a key shows only what ran on that key.
+    const perKey = keyView !== "all" && data.perKey && data.perKey[win] && data.perKey[win][keyView];
+    const w = keyView === "all"
+      ? data.windows && data.windows[win]
+      : (perKey ? perKey.total : { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, cost: 0 });
     if (!w) { footer.textContent = "no data yet for " + win; return; }
 
     cardValues.requests.textContent = String(w.requests);
@@ -761,7 +790,8 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     // gateway no longer lists) has no price entry, so its history is not shown here.
     const offered = data.pricing ? new Set(Object.keys(data.pricing)) : null;
     const models = {};
-    for (const [name, m] of Object.entries((data.models && data.models[win]) || {})) {
+    const rowsSrc = keyView === "all" ? ((data.models && data.models[win]) || {}) : (perKey ? perKey.models : {});
+    for (const [name, m] of Object.entries(rowsSrc)) {
       if (!offered || offered.has(name)) models[name] = m;
     }
     for (const name of offered || []) {
