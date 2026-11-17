@@ -75,7 +75,7 @@ const LIMITS_DEFAULT =
 // Env format (FASFAS_PROXY_TOKEN_LIMITS): "haiku-5.5=2000000/60s".
 // Unlisted models have no token budget.
 const TOKEN_LIMITS_DEFAULT =
-  "deepseek-v4.1-flash=2000000/60s,glm-5.3-flash=2000000/60s," +
+  "deepseek-v4.1-flash=5000000/60s,glm-5.3-flash=2000000/60s," +
   "glm-5.2=1000000/60s,haiku-5.5=2000000/60s";
 
 // USD per 1M tokens, from the OpenCode Go table (off-peak where a model has

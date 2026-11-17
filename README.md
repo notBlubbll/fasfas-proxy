@@ -32,7 +32,7 @@ on a different model instead of killing the turn.
 
 | Model | Context | Output | Image | Tools | Req/min | Tok/min |
 | --- | --- | --- | --- | --- | --- | --- |
-| `deepseek-v4.1-flash` | 1,048,576 | 65,536 | ✅ native | yes | 40 | 2,000,000 |
+| `deepseek-v4.1-flash` | 1,048,576 | 65,536 | ? native | yes | 40 | 5,000,000 |
 | `glm-5.3-flash` | 1,048,576 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
 | `glm-5.2` | 1,048,576 | 65,536 | ❌ text only | yes | 10 | 1,000,000 |
 | `haiku-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
