@@ -191,23 +191,30 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   const keyFilterBox = document.createElement("span");
   keyFilterBox.style.cssText = "display:inline-flex;gap:4px;margin-left:6px;padding-left:8px;border-left:" + BORDER;
   head.appendChild(keyFilterBox);
+  const keySelect = document.createElement("select");
+  keySelect.setAttribute("aria-label", "Usage for key");
+  keySelect.style.cssText = [
+    "padding:3px 8px", "border-radius:999px", "border:1px solid rgba(127,127,127,.3)",
+    "background:transparent", "color:inherit", "cursor:pointer", "font:inherit", "line-height:1.5",
+  ].join(";");
+  keySelect.onchange = () => { keyView = keySelect.value; paint(); };
+  keyFilterBox.appendChild(keySelect);
+  let keyOptionsSig = "";
   function renderKeyFilter() {
     const ids = ["all", ...keys.map((k) => String(k.index))];
     if (!ids.includes(keyView)) keyView = "all";
-    keyFilterBox.textContent = "";
-    for (const id of ids) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = id === "all" ? "all keys" : "key " + id;
-      b.style.cssText = [
-        "padding:3px 9px", "border-radius:999px", "border:1px solid rgba(127,127,127,.3)",
-        "background:" + (id === keyView ? "rgba(127,127,127,.22)" : "transparent"),
-        "color:inherit", "cursor:pointer", "font:inherit", "line-height:1.5",
-        "font-weight:" + (id === keyView ? "650" : "400"),
-      ].join(";");
-      b.onclick = () => { keyView = id; paint(); };
-      keyFilterBox.appendChild(b);
+    const sig = ids.join(",");
+    if (sig !== keyOptionsSig) {
+      keyOptionsSig = sig;
+      keySelect.textContent = "";
+      for (const id of ids) {
+        const o = document.createElement("option");
+        o.value = id;
+        o.textContent = id === "all" ? "all keys" : "key " + id;
+        keySelect.appendChild(o);
+      }
     }
+    keySelect.value = keyView;
   }
 
   const refreshBtn = document.createElement("button");
