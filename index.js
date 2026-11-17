@@ -119,9 +119,19 @@ const PRICING = { ...PRICING_DEFAULT, ...parsePricing(process.env.FASFAS_PROXY_P
 
 // Cost of one record. Cached tokens are part of the prompt count and are billed
 // at the cached-read rate instead of the full input rate.
+// Models that charge more once the whole prompt passes a size (Anthropic's
+// standard API: up to 100K prompt tokens vs over 100K). Keyed by model, with the
+// rates for the larger tier. Cache writes are not reported by the gateway, so
+// they are not billed here.
+const PRICING_TIERS = {
+  "haiku-5.5": { over: 100000, in: 0.5, out: 2.5, cached: 0.05 },
+};
+
 function recordCost(r) {
-  const p = PRICING[r.m] || RETIRED_PRICING[r.m];
+  let p = PRICING[r.m] || RETIRED_PRICING[r.m];
   if (!p) return 0;
+  const tier = PRICING_TIERS[r.m];
+  if (tier && (r.i || 0) > tier.over) p = tier;
   const cached = Math.min(r.c || 0, r.i || 0);
   const fresh = Math.max(0, (r.i || 0) - cached);
   return (fresh * p.in + cached * p.cached + (r.o || 0) * p.out) / 1e6;
