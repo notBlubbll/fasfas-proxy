@@ -852,6 +852,10 @@ function keySlotForSession(sessionId) {
   const counts = liveSessionCounts();
   const slot = counts.indexOf(Math.min(...counts)) + 1;
   sessionKeyPins.set(sessionId, slot);
+  // Clear the slot history: the old slots were on a different key's limiter, so
+  // they do not count toward the new key's windows.
+  const a = sessionActivity.get(sessionId);
+  if (a) a.slots = [];
   saveKeys();
   return slot;
 }
@@ -934,21 +938,21 @@ const PING_PROMPT = "State the model you are and reply in exactly this form: I r
 const PING_MAX_WAIT_MS = Number(process.env.FASFAS_PROXY_PING_WAIT_MS) || 180000;
 let lastAuthHeader = null; // most recent gateway credential seen on a real request
 
-async function pingModel(model, auth) {
+async function pingModel(model, auth, pingSlot = 0) {
   const started = Date.now();
   // Include the reply budget so the token reservation cannot push a window over
   // its cap: the limiter sees prompt + max_tokens up front.
   const estTokens = Math.ceil((PING_PROMPT.length + 64) / 4) + 60;
-  // A ping is not a session, so it runs on key 1 and never touches a pinned
-  // session's windows on another key.
-  const pingSlot = keyPool.length ? 1 : 0;
-  const lim = limiterFor(model, pingSlot);
+  // A ping is not a session. Run it on the key with the fewest live sessions
+  // so it does not compete with real traffic on a busy key.
+  const slot = pingSlot || (keyPool.length ? 1 : 0);
+  const lim = limiterFor(model, slot);
   let reservation = null;
   let queueMs = 0;
 
   if (lim) {
     PROXY_STATE.queued++;
-    try { reservation = await acquire(model, estTokens, PING_MAX_WAIT_MS, pingSlot); } finally { PROXY_STATE.queued--; }
+    try { reservation = await acquire(model, estTokens, PING_MAX_WAIT_MS, slot); } finally { PROXY_STATE.queued--; }
     queueMs = Date.now() - started;
     if (reservation && reservation.spill) {
       const waitMs = lim.waitTime(Date.now(), estTokens);
@@ -977,9 +981,17 @@ async function pingModel(model, auth) {
 }
 
 // One limiter per model, so the models are pinged concurrently and a busy model
-// only delays its own row.
+// only delays its own row. All pings share the same key: the one with the fewest
+// live sessions, so a ping does not compete with real traffic on a busy key.
 async function pingModels(models, auth) {
-  return Promise.all(models.map((m) => pingModel(m, auth)));
+  const counts = liveSessionCounts();
+  let slot = 0;
+  if (keyPool.length) {
+    slot = 1;
+    for (let i = 1; i < counts.length; i++) if (counts[i] < counts[slot - 1]) slot = i + 1;
+  }
+  log(`ping using key ${slot} (${counts.join("/") || "no keys"} live sessions)`);
+  return Promise.all(models.map((m) => pingModel(m, auth, slot)));
 }
 
 // ---- vision handoff --------------------------------------------------------
@@ -1414,6 +1426,8 @@ async function handle(req, res) {
           return sendJson(res, 400, JSON.stringify({ error: `no key ${slot}; ${keyPool.length} configured` }));
         }
         sessionKeyPins.set(body.pin.session, slot);
+        const a = sessionActivity.get(body.pin.session);
+        if (a) a.slots = []; // reset: the old slots were on a different key's limiter
         log(`pinned session ${body.pin.session} to key ${slot}`);
       } else if (typeof body.unpin === "string") {
         sessionKeyPins.delete(body.unpin);
