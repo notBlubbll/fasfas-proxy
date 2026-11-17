@@ -1005,7 +1005,7 @@ const VISION_MODEL_DEFAULT = "glm-5.3-flash";
 // default. Captioning throws the pixels away, which breaks anything that needs
 // the actual image. List a model here only if it really cannot see.
 // A rejected image request still falls back to captions automatically.
-const VISION_TARGETS_DEFAULT = "";
+const VISION_TARGETS_DEFAULT = "glm-5.2";
 const VISION_PROMPT_DEFAULT =
   "Describe this image in full detail for a text-only assistant that cannot see it. " +
   "Transcribe all text, code, UI labels, error messages, tables and diagrams exactly. " +

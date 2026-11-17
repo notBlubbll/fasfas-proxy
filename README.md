@@ -225,8 +225,11 @@ upstream rejected an image request for sonnet-5.5 (400); retrying with captions 
 > Anthropic-backed models validate the PNG and reject one whose chunk CRC is
 > wrong, while the GLM/Qwen/DeepSeek endpoints accept it silently.
 
-Forcing captioning for a model that is genuinely blind is opt-in:
+Forcing captioning for a model that is genuinely blind is on by default for
+`glm-5.2` (text-only). To add another:
 
+```sh
+FASFAS_PROXY_VISION_TARGETS="glm-5.2,other-text-only-model"
 ```
 FASFAS_PROXY_VISION_TARGETS="some-text-only-model"
 ```
@@ -309,7 +312,7 @@ The provider's `apiKey` in OpenCode only has to be non-empty once keys are in th
 | `FASFAS_PROXY_PRICING` | table above | `model=in/out/cached`, USD per 1M tokens |
 | `FASFAS_PROXY_RL_BUDGET_MS` | `600000` | wall-clock ceiling for `429` waits per request |
 | `FASFAS_PROXY_VISION` | on | `0` disables the caption fallback |
-| `FASFAS_PROXY_VISION_TARGETS` | (none) | models to caption for unconditionally (`*`, `prefix*` allowed) |
+| `FASFAS_PROXY_VISION_TARGETS` | `glm-5.2` | models to caption for unconditionally (`*`, `prefix*` allowed); `glm-5.2` is text-only |
 | `FASFAS_PROXY_VISION_MODEL` | `glm-5.3-flash` | captioning model |
 | `FASFAS_PROXY_VISION_PROMPT` | built-in | caption prompt override |
 | `FASFAS_PROXY_OVERFLOW` | (none) | `from=to:wait` spill rules, e.g. `glm-5.3-flash=deepseek-v4.1-flash:20s` |
