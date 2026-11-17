@@ -131,7 +131,9 @@ function recordCost(r) {
   let p = PRICING[r.m] || RETIRED_PRICING[r.m];
   if (!p) return 0;
   const tier = PRICING_TIERS[r.m];
-  if (tier && (r.i || 0) > tier.over) p = tier;
+  // Imported billing rows are totals over many requests, so their size says nothing
+  // about any one request: they keep the flat rate.
+  if (tier && !r.seed && (r.i || 0) > tier.over) p = tier;
   const cached = Math.min(r.c || 0, r.i || 0);
   const fresh = Math.max(0, (r.i || 0) - cached);
   return (fresh * p.in + cached * p.cached + (r.o || 0) * p.out) / 1e6;
