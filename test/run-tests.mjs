@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
+import zlib from "node:zlib";
 
 // The proxy keeps keys and session pins in a file. Tests get their own, so a run
 // can never inherit pins from an earlier one or touch the repo's real state.
@@ -41,11 +42,17 @@ const mock = createServer((req, res) => {
     let body = {};
     try { body = JSON.parse(raw || "{}"); } catch {}
     const startedAt = Date.now();
-    seen.push({ path: req.url, auth: req.headers.authorization, body, raw, startedAt });
+    seen.push({ path: req.url, auth: req.headers.authorization, body, raw, startedAt, acceptEncoding: req.headers["accept-encoding"] });
 
     if (req.url === "/v1/chat/completions" && body.model === "mock-imgreject" && raw.includes('"image_url"')) {
       res.writeHead(400, { "content-type": "application/json" });
       return res.end(JSON.stringify({ error: { code: "upstream_rejected_request", message: "Provider returned error" } }));
+    }
+
+    if (req.url === "/v1/chat/completions" && body.model === "mock-gzip") {
+      // a compressed error reply, even though the client asked for identity
+      res.writeHead(400, { "content-type": "application/json", "content-encoding": "gzip" });
+      return res.end(zlib.gzipSync(JSON.stringify({ error: { message: "gzipped boom" } })));
     }
 
     if (req.url === "/v1/chat/completions" && body.model === "mock-5xx") {
@@ -696,6 +703,25 @@ log("\nlive sessions decide placement, pins follow their key");
   ok("and the session keeps the same credential", seen[seen.length - 1].auth === "Bearer sk-load-bbbb2222", seen[seen.length - 1].auth);
   ok("a session on the removed key loses its pin", after.pins.ses_live1 === undefined, JSON.stringify(after.pins));
   await api({ keys: [] });
+}
+
+log("\na compressed upstream reply reaches the client as plain bytes");
+{
+  // raw fetch: no transparent decoding, so a bad content-encoding would show up
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock-gzip", messages: [{ role: "user", content: "hi" }] }),
+  }).catch((e) => ({ err: e }));
+  if (r.err) ok("the reply reads without a decode error", false, String(r.err));
+  else {
+    const enc = r.headers.get("content-encoding");
+    const txt = await r.text().catch((e) => "DECODE " + e.message);
+    ok("the reply is not left compressed", enc === null, String(enc));
+    ok("the error text arrives readable", txt.includes("gzipped boom"), txt.slice(0, 80));
+  }
+  const mockHit = seen[seen.length - 1];
+  ok("the upstream is asked for identity encoding", mockHit?.body?.model === "mock-gzip" && mockHit.acceptEncoding === "identity", String(mockHit?.acceptEncoding));
 }
 
 log("\nold images are dropped when a body is over the gateway limit");

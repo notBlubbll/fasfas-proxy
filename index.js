@@ -22,6 +22,7 @@
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { createHash } from "node:crypto";
+import zlib from "node:zlib";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1243,7 +1244,17 @@ function buildForwardHeaders(inbound, bodyLength) {
     out[k] = v;
   }
   out["content-length"] = String(bodyLength);
+  out["accept-encoding"] = "identity"; // plain replies; decoderFor() covers the rest
   return out;
+}
+
+// Decoder for a compressed upstream reply, or null when the bytes are plain.
+function decoderFor(encoding) {
+  const e = String(encoding || "").trim().toLowerCase();
+  if (e === "gzip" || e === "x-gzip") return zlib.createGunzip();
+  if (e === "deflate") return zlib.createInflate();
+  if (e === "br") return zlib.createBrotliDecompress();
+  return null;
 }
 
 function parseRetryAfterMs(headers) {
@@ -1694,8 +1705,15 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       finish({ done: true });
     });
 
-    up.on("response", (upRes) => {
-      const status = upRes.statusCode || 502;
+    up.on("response", (rawRes) => {
+      const status = rawRes.statusCode || 502;
+      // We ask for identity, but the gateway may still compress a reply. Decode it
+      // here: the client gets plain bytes and the headers stay consistent with them.
+      // Passing compressed bytes with a content-encoding header, or decoding them as
+      // text, is what makes the client fail with "error decoding response body".
+      const dec = decoderFor(rawRes.headers["content-encoding"]);
+      const upRes = dec ? rawRes.pipe(dec) : rawRes;
+      if (dec) rawRes.on("error", (e) => dec.destroy(e));
       upRes.on("data", (c) => {
         respBytes += c.length;
         if (!firstByteAt) firstByteAt = Date.now();
@@ -1712,10 +1730,11 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
           }
         }
       });
-      const hdrs = { ...upRes.headers, ...(opts.headers || {}) };
+      const hdrs = { ...rawRes.headers, ...(opts.headers || {}) };
       delete hdrs["transfer-encoding"];
       delete hdrs["content-length"];
       delete hdrs.connection;
+      if (dec) delete hdrs["content-encoding"]; // the bytes below are already decoded
 
       if (status !== 200) {
         // Always leave a trace of a non-2xx: this is what makes a failed turn
@@ -1728,9 +1747,9 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
           upRes.on("end", () => {
             const text = Buffer.concat(chunks).toString("utf8");
             log(`res ${status} model=${model || "-"} :: ${text.replace(/\s+/g, " ").slice(0, 400)}`);
-            if (status === 429 && isChat && model) return finish({ retry: true, status, headers: upRes.headers, text });
+            if (status === 429 && isChat && model) return finish({ retry: true, status, headers: rawRes.headers, text });
             // Transient 5xx: let the caller retry the same body.
-            if (status >= 500 && isChat && opts.retry5xx) return finish({ serverError: true, status, headers: upRes.headers, text });
+            if (status >= 500 && isChat && opts.retry5xx) return finish({ serverError: true, status, headers: rawRes.headers, text });
             // The upstream refused a request that carries images: let the caller
             // retry once with the images captioned instead of failing the turn.
             if (status === 400 && opts.imageFallback) return finish({ visionFallback: true, status, text });
