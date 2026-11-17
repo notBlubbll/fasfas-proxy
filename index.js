@@ -1146,7 +1146,16 @@ async function visionHandoff(rawBody, model, auth, force = false, slot = 0) {
   let json;
   try { json = JSON.parse(rawBody.toString("utf8")); } catch { return rawBody; }
   const imgs = collectImageParts(json);
-  if (imgs.length === 0) return rawBody;
+  if (imgs.length === 0) {
+    // Log what content types are in the messages, so a blind model that still
+    // receives images in a format we don't recognize is visible.
+    const types = new Set();
+    for (const m of json.messages || []) {
+      if (Array.isArray(m?.content)) for (const p of m.content) if (p?.type) types.add(p.type);
+    }
+    log(`vision handoff skipped model=${model}: no image_url parts found; content types: ${[...types].join(",") || "none"}`);
+    return rawBody;
+  }
 
   const origSize = rawBody.length;
   let analyzed = 0, cached = 0, failed = 0;
