@@ -36,7 +36,6 @@ on a different model instead of killing the turn.
 | `glm-5.3-flash` | 1,048,576 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
 | `glm-5.2` | 1,048,576 | 65,536 | ❌ text only | yes | 10 | 1,000,000 |
 | `haiku-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
-| `sonnet-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 6 | 1,000,000 |
 
 Image generation (`POST /v1/images/generations`), passed through and counted in the
 usage table, with no request or token limits on the gateway:
@@ -56,8 +55,8 @@ usage table, with no request or token limits on the gateway:
   models from its own catalog). Call the endpoint directly.
 - All the chat models speak tools, streaming and `reasoning_effort`, and expose the variants
   `low` / `medium` / `high` / `xhigh` / `max`.
-- **The limits are per model, not shared.** The aggregate ceiling is 96 req/min
-  and 8M tok/min, reached only by running every model at once; saturating one
+- **The limits are per model, not shared.** The aggregate ceiling is 90 req/min
+  and 7M tok/min, reached only by running every model at once; saturating one
   model leaves the others untouched.
 - **Images are passed through untouched.** The other chat models see images natively
   (verified: haiku and sonnet name all four quadrants of a 64×64 image), so the
@@ -66,9 +65,8 @@ usage table, with no request or token limits on the gateway:
   support image input` from the gateway. For code it passed a check: it wrote a
   `parseDuration` function that passed 11 of 11 test cases in about 2s, and it
   returned a correct tool call.
-- `sonnet-5.5` is the scarcest at 6 requests/minute per key (12 with two keys).
-  Point subagents at `deepseek-v4.1-flash` (40/min per key) rather than letting a
-  fan-out eat sonnet's budget.
+- `deepseek-v4.1-flash` is the largest budget (40 requests/minute per key). Use it for
+  fan-out work instead of the smaller caps.
 
 > **Costs** in `/usage` and the panel are estimates using OpenCode's published
 > token rates. They are not what this gateway bills (it currently bills nothing).
@@ -85,10 +83,11 @@ config entry).
 | Model | Context | Output | Image | Req/min | Tok/min | Status | Retired | Why |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `qwen3.8-27b` | 1,000,000 | 65,536 | ✅ native | 20 | 3,000,000 | removed | 2026-11-16 | gone from `/v1/models`; calls return `404` |
-| `gemini-4hy` (Gemini 4 Hydrogen) | 1,000,000 | 65,536 | not tested | 20 | 3,000,000 | removed | 2026-11-16 | listed briefly; upstream rejected every call (ZDR policy), then it left `/v1/models` |
+| `sonnet-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 6 | 1,000,000 | removed | 2026-11-17 | gone from `/v1/models`; calls return `404` |
+| gemini-4hy (Gemini 4 Hydrogen) | 1,000,000 | 65,536 | not tested | 20 | 3,000,000 | removed | 2026-11-16 | listed briefly; upstream rejected every call (ZDR policy), then it left `/v1/models` |
 
 - In the live OpenCode config a retired model can be kept as `disabled: true`
-  instead of deleting it. `qwen3.8-27b` is set that way on the author's machine.
+  instead of deleting it. `qwen3.8-27b` and `sonnet-5.5` are set that way on the author's machine.
 - Requests a retired model already served stay in the usage history with their
   cost (the proxy keeps their price internally), but the panel shows no row for it.
 - To restore one: add its limits to `FASFAS_PROXY_LIMITS` / `FASFAS_PROXY_TOKEN_LIMITS`
@@ -104,7 +103,6 @@ each model so no window carried leftover traffic:
 | --- | --- | --- |
 | `glm-5.3-flash` | 20 | `(20 requests per minute)` |
 | `haiku-5.5` | 20 | `(20 requests per minute)` |
-| `sonnet-5.5` | 6 | `(6 requests per minute)` |
 | `deepseek-v4.1-flash` | 35+ (no failure) | dashboard shows 40/min |
 
 Supporting observations: `retry-after` was accurate to the second (waited 50s →
@@ -197,13 +195,13 @@ instead of queueing — the same idea as the compaction handoff, applied to
 ordinary traffic.
 
 ```
-FASFAS_PROXY_OVERFLOW="sonnet-5.5=haiku-5.5:20s"
+FASFAS_PROXY_OVERFLOW="glm-5.3-flash=deepseek-v4.1-flash:20s"
 ```
 
 - Off by default: it swaps the model mid-conversation, so it is opt-in.
 - The rule also applies to upstream `429`s: if the required wait exceeds the
   threshold, the request spills immediately instead of sleeping.
-- A spilled response carries `x-fasfas-overflow: sonnet-5.5->haiku-5.5`, and the
+- A spilled response carries `x-fasfas-overflow: glm-5.3-flash->deepseek-v4.1-flash`, and the
   log line is `overflow sonnet-5.5 -> haiku-5.5 (…)`.
 - `/status` reports the rules and a spill count per source model.
 - A request never spills twice, so a fallback cannot chain.
@@ -314,7 +312,7 @@ The provider's `apiKey` in OpenCode only has to be non-empty once keys are in th
 | `FASFAS_PROXY_VISION_TARGETS` | (none) | models to caption for unconditionally (`*`, `prefix*` allowed) |
 | `FASFAS_PROXY_VISION_MODEL` | `glm-5.3-flash` | captioning model |
 | `FASFAS_PROXY_VISION_PROMPT` | built-in | caption prompt override |
-| `FASFAS_PROXY_OVERFLOW` | (none) | `from=to:wait` spill rules, e.g. `sonnet-5.5=haiku-5.5:20s` |
+| `FASFAS_PROXY_OVERFLOW` | (none) | `from=to:wait` spill rules, e.g. `glm-5.3-flash=deepseek-v4.1-flash:20s` |
 | `FASFAS_PROXY_COMPACTION` | on | `0` disables compaction protection |
 | `FASFAS_PROXY_COMPACTION_MODEL` | `glm-5.3-flash` | fallback for blocked summaries |
 | `FASFAS_PROXY_COMPACTION_MIN_BYTES` | `20000` | prompt size that marks a tool-less request as compaction |

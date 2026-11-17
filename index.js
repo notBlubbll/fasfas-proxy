@@ -67,7 +67,7 @@ const UPSTREAM = (() => {
 // Per key, as measured on one key. The account total is these caps times the
 // number of configured keys, so a second key doubles what the panel shows.
 const LIMITS_DEFAULT =
-  "sonnet-5.5=6/60s,glm-5.3-flash=20/60s,glm-5.2=10/60s," +
+  "glm-5.3-flash=20/60s,glm-5.2=10/60s," +
   "haiku-5.5=20/60s,deepseek-v4.1-flash=40/60s";
 
 // Token-per-minute budget per model, straight from the gateway dashboard.
@@ -75,7 +75,7 @@ const LIMITS_DEFAULT =
 // Unlisted models have no token budget.
 const TOKEN_LIMITS_DEFAULT =
   "deepseek-v4.1-flash=2000000/60s,glm-5.3-flash=2000000/60s," +
-  "glm-5.2=1000000/60s,haiku-5.5=2000000/60s,sonnet-5.5=1000000/60s";
+  "glm-5.2=1000000/60s,haiku-5.5=2000000/60s";
 
 // USD per 1M tokens, from the OpenCode Go table (off-peak where a model has
 // peak/off-peak pricing) and the Console table for models Go does not list.
@@ -84,7 +84,6 @@ const PRICING_DEFAULT = {
   "deepseek-v4.1-flash": { in: 0.15, out: 0.60, cached: 0.003 },
   "glm-5.3-flash": { in: 0.15, out: 0.50, cached: 0.03 },
   "haiku-5.5": { in: 0.10, out: 0.50, cached: 0.01 },
-  "sonnet-5.5": { in: 2.00, out: 10.00, cached: 0.10 },
   // OpenCode Go table. The gateway lists it at $0, like its other models.
   "glm-5.2": { in: 1.40, out: 4.40, cached: 0.26 },
   // Image generation is not billed per token here.
@@ -97,6 +96,7 @@ const PRICING_DEFAULT = {
 // back, move it into PRICING_DEFAULT and restore its limits above.
 const RETIRED_PRICING = {
   "qwen3.8-27b": { in: 0.15, out: 0.47, cached: 0.016 }, // gone from the gateway (404)
+  "sonnet-5.5": { in: 2.00, out: 10.00, cached: 0.10 }, // gone from the gateway (404)
 };
 
 function parsePricing(src) {

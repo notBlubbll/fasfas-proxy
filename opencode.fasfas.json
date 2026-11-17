@@ -308,65 +308,6 @@
                         "context": 1000000,
                         "output": 65536
                     }
-                },
-                "sonnet-5.5": {
-                    "name": "Claude Sonnet 5.5",
-                    "cost": {
-                        "input": 2,
-                        "output": 10,
-                        "cache_read": 0.1,
-                        "cache_write": 2.5
-                    },
-                    "capabilities": {
-                        "tools": true,
-                        "input": [
-                            "text",
-                            "image"
-                        ],
-                        "output": [
-                            "text"
-                        ]
-                    },
-                    "compatibility": {
-                        "reasoningField": "reasoning",
-                        "cacheFormat": "anthropic"
-                    },
-                    "variants": [
-                        {
-                            "id": "low",
-                            "settings": {
-                                "reasoningEffort": "low"
-                            }
-                        },
-                        {
-                            "id": "medium",
-                            "settings": {
-                                "reasoningEffort": "medium"
-                            }
-                        },
-                        {
-                            "id": "high",
-                            "settings": {
-                                "reasoningEffort": "high"
-                            }
-                        },
-                        {
-                            "id": "xhigh",
-                            "settings": {
-                                "reasoningEffort": "xhigh"
-                            }
-                        },
-                        {
-                            "id": "max",
-                            "settings": {
-                                "reasoningEffort": "max"
-                            }
-                        }
-                    ],
-                    "limit": {
-                        "context": 1000000,
-                        "output": 65536
-                    }
                 }
             }
         }
