@@ -891,6 +891,8 @@ function keysReport() {
     const lim = slot && a.model ? limiterFor(a.model, slot) : null;
     if (lim && (lim.max > 0 || lim.tokenMax > 0)) {
       const snap = lim.snapshot(now);
+      // A session can run on different models. Each slot records the model it was
+      // for, so count only the slots on this model, in its window.
       const mine = (a.slots || []).filter((x) => x.model === a.model && now - x.t < snap.windowMs);
       const myTokens = (a.slots || [])
         .filter((x) => x.model === a.model && x.entry && now - x.t < snap.tokenWindowMs)
