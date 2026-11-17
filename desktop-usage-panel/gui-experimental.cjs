@@ -47,6 +47,20 @@ function elapsedSeconds(session) {
 }
 
 const WINDOWS = ["24h", "7d", "30d", "all"];
+
+// Readable names for model ids. Unknown ids fall back to the id itself.
+const MODEL_NAMES = {
+  "haiku-5.5": "Claude Haiku 5.5",
+  "sonnet-5.5": "Claude Sonnet 5.5",
+  "deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
+  "glm-5.3-flash": "GLM 5.3 Flash",
+  "glm-5.2": "GLM 5.2",
+  "qwen3.8-27b": "Qwen 3.8 27B",
+  "gemini-4hy": "Gemini 4 Hydrogen",
+  "mai-image-2.6-flash": "MAI Image 2.6 Flash",
+  "mai-image-2.6": "MAI Image 2.6",
+};
+const displayModel = (id) => MODEL_NAMES[id] || String(id || "");
 // Shown in place of a saved key. The real value is only fetched on Show.
 const KEY_MASK = "••••••••••••••••";
 const COLUMNS = [
@@ -324,9 +338,9 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       // A session that overflowed shows the model actually serving it, with a *
       // and the model it was meant for in the tooltip.
       const spilled = !!s.from && !!s.model;
-      tr.appendChild(td(s.model ? s.model + (spilled ? " *" : "") : "–", "left", {
+      tr.appendChild(td(s.model ? displayModel(s.model) + (spilled ? " *" : "") : "–", "left", {
         last, muted: !s.model, model: true,
-        title: spilled ? `overflow: ${s.from} was full, so this session's request runs on ${s.model}` : (s.model || ""),
+        title: spilled ? `overflow: ${displayModel(s.from)} was full, so this session's request runs on ${displayModel(s.model)} (${s.model})` : (s.model || ""),
       }));
 
       const lim = s.limit;
@@ -704,7 +718,8 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     // `*` while this model is serving requests that overflowed from another one.
     const spill = overflowActive[name];
     const label = document.createElement("span");
-    label.textContent = name + (spill ? ` *${spill.count}` : "");
+    label.textContent = displayModel(name) + (spill ? ` *${spill.count}` : "");
+    label.title = name; // the API id on hover
     if (spill) {
       label.title = `${spill.count} of the used slots in the last minute came from ${spill.from.join(", ")} overflowing here` +
         (spill.inFlight ? ` (${spill.inFlight} still running)` : "");
@@ -807,7 +822,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     const rows = Object.entries(models).sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0) || (b[1].output || 0) - (a[1].output || 0));
     for (const [name, m] of rows) {
       const tr = document.createElement("tr");
-      tr.appendChild(slotCell(td(name, "left", { model: true }), name));
+      tr.appendChild(slotCell(td(displayModel(name), "left", { model: true, title: name }), name));
       tr.appendChild(td(String(m.requests), "right"));
       tr.appendChild(td(fmt(m.input), "right"));
       tr.appendChild(td(fmt(m.output), "right"));
