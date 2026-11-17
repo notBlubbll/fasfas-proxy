@@ -291,6 +291,9 @@ function windowStats(model, since, slot) {
   for (const r of usage.records) {
     if (r.t < since) continue;
     if (model && r.m !== model) continue;
+    // Totals leave out retired models, so the overview shows only what is offered.
+    // Their records stay in the log and can still be read per model.
+    if (!model && RETIRED_PRICING[r.m]) continue;
     if (slot !== undefined && (r.k || 0) !== slot) continue;
     acc.requests += r.n || 1;
     acc.input += r.i || 0;
