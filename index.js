@@ -1903,7 +1903,7 @@ async function deferWhileBusy(model) {
 // the window. Long sessions with screenshots hit the byte limit first, so when a
 // body is over the trigger the oldest images are replaced with a short note, until
 // it is under the target. The newest images are kept.
-const IMAGE_SHRINK_TRIGGER = Math.round((Number(process.env.FASFAS_PROXY_IMAGE_SHRINK_MB) || 10) * 1024 * 1024);
+const IMAGE_SHRINK_TRIGGER = Math.round((Number(process.env.FASFAS_PROXY_IMAGE_SHRINK_MB) || 8) * 1024 * 1024);
 const IMAGE_SHRINK_TARGET = Math.round(IMAGE_SHRINK_TRIGGER * 0.9);
 const IMAGE_NOTE = "[image removed to keep the request under the 12 MB gateway limit]";
 
