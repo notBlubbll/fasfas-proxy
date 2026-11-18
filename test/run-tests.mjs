@@ -779,6 +779,25 @@ log("\nold images are dropped when a body is over the gateway limit");
   ok("only the newest 6 images are kept", kept2 === 6 && sent2.includes("Image previously shared"), `image parts: ${kept2}`);
 }
 
+log("\ncompaction body is trimmed when it would not fit the model's context");
+{
+  // ~1.2M tokens of history in 40 messages, so the summary request must be trimmed
+  const big = "lorem ipsum ".repeat(2e4); // ~60 KB per message
+  const msgs = [{ role: "system", content: "You are helpful." }];
+  for (let i = 0; i < 40; i++) msgs.push({ role: i % 2 ? "assistant" : "user", content: big + i });
+  msgs.push({ role: "user", content: "Summarize the conversation so far." });
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model: "haiku-5.5", stream: false, messages: msgs }),
+  });
+  const sent = seen[seen.length - 1];
+  const sentTokens = Math.ceil(String(sent?.raw || "").length / 4);
+  ok("the summary request was sent", r.status === 200 || r.status === 400, String(r.status));
+  ok("the forwarded summary request fits the context window", sentTokens <= 1_000_000, `${sentTokens} tokens`);
+  ok("the omitted messages are noted", String(sent?.raw || "").includes("earlier messages omitted"), "");
+}
+
 log("\nhot reload without a service restart");
 {
   const api = (b) => fetch(`${base}/keys`, { method: "POST", body: JSON.stringify(b) }).then((x) => x.json());

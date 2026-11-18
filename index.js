@@ -1957,6 +1957,57 @@ function trimOldImages(body) {
   return out;
 }
 
+// Context windows as the gateway reports them (/v1/models max_model_len).
+// Used only to decide when a compaction request is too big to send whole.
+const CONTEXT_WINDOWS = {
+  "haiku-5.5": 1000000,
+  "glm-5.2": 1048576,
+  "glm-5.3-flash": 1048576,
+  "deepseek-v4.1-flash": 1048576,
+};
+
+// Trim a compaction body so the summary request fits in the model's context.
+// Keeps the system prompt (if any) and the most recent messages; drops older
+// middle messages, replacing them with a note.
+function trimConversationForCompaction(body, maxTokens) {
+  let json;
+  try { json = JSON.parse(body.toString("utf8")); } catch { return null; }
+  const msgs = json.messages;
+  if (!Array.isArray(msgs) || msgs.length < 3) return null;
+
+  // Estimate tokens per message (rough: bytes / 4)
+  const msgTokens = msgs.map((m) => {
+    const s = JSON.stringify(m);
+    return Math.ceil(s.replace(/data:[^"\\]+/g, "data:image").length / 4);
+  });
+  const total = msgTokens.reduce((a, b) => a + b, 0);
+  if (total <= maxTokens) return null;
+
+  // Keep the first message (often system or first user) and the last N messages.
+  // Drop from the front of the conversation (oldest first).
+  const keep = 1; // first
+  let budget = maxTokens - msgTokens.slice(-keep).reduce((a, b) => a + b, 0) - msgTokens[0];
+  if (budget < 100) budget = 100;
+
+  // Walk from the end, keeping messages until budget is spent.
+  let keptFromEnd = 0;
+  for (let i = msgs.length - 1; i > keep; i--) {
+    if (budget - msgTokens[i] < 0) break;
+    budget -= msgTokens[i];
+    keptFromEnd++;
+  }
+
+  const firstMsg = msgs[0];
+  const keptMsgs = msgs.slice(msgs.length - keptFromEnd);
+  const dropped = msgs.length - 1 - keptFromEnd;
+  json.messages = [
+    firstMsg,
+    { role: "system", content: `[${dropped} earlier messages omitted to fit the context window for this summary request]` },
+    ...keptMsgs,
+  ];
+  return Buffer.from(JSON.stringify(json), "utf8");
+}
+
 function rewriteModel(body, model) {
   try {
     const json = JSON.parse(body.toString("utf8"));
@@ -2042,7 +2093,19 @@ function writeBuffered(res, r) {
 // handoff model if the provider blocked it. Returns true when the client has
 // been answered.
 async function runCompaction(req, res, url, body, model, slot = 0) {
-  const estTokens = estimateTokens(body);
+  let estTokens = estimateTokens(body);
+  // A compaction request can be larger than the model's context: the whole
+  // conversation is sent to summarize. Trim it to the most recent messages
+  // so the summary request fits, keeping the system prompt and the latest turn.
+  const ctxLimit = CONTEXT_WINDOWS[model] || 1_000_000;
+  if (estTokens > ctxLimit * 0.85) {
+    const trimmed = trimConversationForCompaction(body, Math.floor(ctxLimit * 0.7));
+    if (trimmed && trimmed.length < body.length) {
+      log(`compaction body trimmed for ${model}: ${body.length} -> ${trimmed.length} bytes (est ${estTokens} -> ${estimateTokens(trimmed)} tokens)`);
+      body = trimmed;
+      estTokens = estimateTokens(body);
+    }
+  }
   let reservation = null;
   if (limiterFor(model, slot)) {
     PROXY_STATE.queued++;
