@@ -55,6 +55,11 @@ const mock = createServer((req, res) => {
       return res.end(zlib.gzipSync(JSON.stringify({ error: { message: "gzipped boom" } })));
     }
 
+    if (req.url === "/v1/chat/completions" && body.model === "mock-stream-error") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      return res.end('data: {"error":{"code":"upstream_rejected_request","message":"Provider returned error","param":null,"type":"invalid_request_error"}}\n\ndata: [DONE]\n');
+    }
+
     if (req.url === "/v1/chat/completions" && body.model === "mock-5xx") {
       fivexxHits++;
       if (fivexxHits <= 2) {
@@ -725,6 +730,17 @@ log("\na compressed upstream reply reaches the client as plain bytes");
 }
 
 log("\nold images are dropped when a body is over the gateway limit");
+{
+  // A 200 SSE stream whose first frame is an error should not be passed through
+  // as a successful 200 to the client. The proxy should detect it and return an
+  // error status after retries.
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock-stream-error", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  });
+  ok("a stream error frame is not passed through as 200", r.status !== 200, String(r.status));
+}
 {
   // three ~4.5 MB screenshots: the oldest must go, the newest must stay
   const img = (n) => ({ type: "image_url", image_url: { url: "data:image/png;base64," + "A".repeat(4.5e6) + n } });

@@ -1754,8 +1754,8 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       upRes.on("data", (c) => {
         respBytes += c.length;
         if (!firstByteAt) firstByteAt = Date.now();
+        const text = c.toString("utf8");
         if (status === 200) {
-          const text = c.toString("utf8");
           tail = (tail + text).slice(-8192);
           // A frame counts as generation when it carries content or reasoning.
           if (/"(content|reasoning|reasoning_content|text)"\s*:\s*"[^"]/.test(text)) {
@@ -1766,12 +1766,53 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
             if (/"(reasoning|reasoning_content)"\s*:\s*"[^"]/.test(text)) sawReasoning = true;
           }
         }
+        // First chunk of a 200 SSE stream: check for an error frame before the
+        // client sees anything. Both error frames and real chunks can share the
+        // chunk, so an error only blocks when no real content is beside it.
+        if (sse && !holdDone && held === null) {
+          held = c;
+          const looksError = /"error"\s*:/.test(text) && !/"choices"/.test(text) && !/"(content|reasoning|reasoning_content|text)"\s*:\s*"/.test(text);
+          if (looksError) {
+            holdDone = true; // nothing goes to the client from this stream
+            const errText = text.replace(/\s+/g, " ").slice(0, 400);
+            log(`res 200 (stream error) model=${model || "-"} :: ${errText}`);
+            if (!res.headersSent) {
+              if (isChat && opts.retry5xx) return finish({ serverError: true, status: 502, headers: rawRes.headers, text: errText });
+              res.writeHead(502, { "content-type": "text/plain" });
+              res.end(`fasfas-proxy: upstream stream error: ${errText}\n`);
+              return finish({ done: true });
+            }
+            try { res.end(); } catch {}
+            return finish({ done: true });
+          }
+          releaseHeld();
+          return;
+        }
+        if (sse && !holdDone) return; // still holding; more data waits for the first-chunk decision
       });
       const hdrs = { ...rawRes.headers, ...(opts.headers || {}) };
       delete hdrs["transfer-encoding"];
       delete hdrs["content-length"];
       delete hdrs.connection;
       if (dec) delete hdrs["content-encoding"]; // the bytes below are already decoded
+
+      // A 200 SSE stream can still carry an error frame as its first data line
+      // (e.g. `data: {"error":{"code":"upstream_rejected_request",...}}`): the
+      // provider failed after the HTTP status was already 200. Buffer the first
+      // chunk and check before anything reaches the client, so the turn can be
+      // retried instead of failing with "Provider returned error".
+      const sse = status === 200 && String(hdrs["content-type"] || "").includes("event-stream");
+      let held = null; // first chunk, kept until we know it is not an error
+      let holdDone = false; // held chunk released to the client (or consumed)
+
+      const releaseHeld = () => {
+        if (holdDone || held === null) return;
+        holdDone = true;
+        res.writeHead(status, hdrs);
+        res.write(held);
+        held = null;
+        upRes.pipe(res); // only the remaining chunks are piped
+      };
 
       if (status !== 200) {
         // Always leave a trace of a non-2xx: this is what makes a failed turn
@@ -1804,12 +1845,19 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       }
 
       log(`res ${status} model=${model || "-"} ct=${hdrs["content-type"] || "-"}`);
-      res.writeHead(status, hdrs);
-      upRes.pipe(res);
-      const timing = () => ({ sentAt, firstTokenAt, lastTokenAt, tokenFrames, sawReasoning });
-      upRes.on("end", () => finish({ done: true, status, bytes: respBytes, tail, timing: timing() }));
-      upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, timing: timing() }); });
+      if (sse) {
+        // SSE: release held first chunk at end if the error check never ran
+        upRes.on("end", () => { releaseHeld(); finish({ done: true, status, bytes: respBytes, tail, timing: timing2() }); });
+        upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, timing: timing2() }); });
+      } else {
+        res.writeHead(status, hdrs);
+        upRes.pipe(res);
+        upRes.on("end", () => finish({ done: true, status, bytes: respBytes, tail, timing: timing2() }));
+        upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, timing: timing2() }); });
+      }
     });
+
+    function timing2() { return { sentAt, firstTokenAt, lastTokenAt, tokenFrames, sawReasoning }; }
 
     res.on("close", () => {
       if (!res.writableEnded) {
