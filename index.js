@@ -1669,12 +1669,16 @@ async function handle(req, res) {
       }
       if (result.serverError) {
         // 5xx from the gateway or its CDN. Usually transient; retry the same
-        // body with backoff, and record it per session for the UI.
+        // body with backoff, and record it per session for the UI. A stream
+        // error (upstream_rejected_request) is NOT transient: the provider
+        // refused the body, and the same body will be refused again, so it is
+        // forwarded after the first attempt.
         const attemptNo = (serverAttempts += 1);
         PROXY_STATE.retries5xx = (PROXY_STATE.retries5xx || 0) + 1;
         noteSessionRetry(sessionId, result.status, model);
-        if (attemptNo > MAX_5XX_RETRIES || Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
-          log(`upstream ${result.status} for ${model} after ${attemptNo - 1} retries; forwarding it (${body.length} bytes)`);
+        const refused = result.text?.includes("upstream_rejected_request") || result.text?.includes("Provider returned error");
+        if (attemptNo > MAX_5XX_RETRIES || refused || Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
+          log(`upstream ${result.status} for ${model} after ${attemptNo - 1} retries${refused ? " (provider refused the body)" : ""}; forwarding it (${body.length} bytes)`);
           clearSessionRetry(sessionId);
           return sendJson(res, result.status, result.text);
         }
