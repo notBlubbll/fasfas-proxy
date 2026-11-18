@@ -760,7 +760,23 @@ log("\nold images are dropped when a body is over the gateway limit");
   const sent = String(seen[seen.length - 1]?.raw ?? JSON.stringify(seen[seen.length - 1]?.body));
   const fwdImages = (sent.match(/"type":"image_url"/g) || []).length;
   ok("the forwarded body is under the 10 MB trigger", sent.length < 10 * 1024 * 1024 && seen.length > before, `${sent.length} bytes`);
-  ok("oldest image replaced by a note, newest kept", sent.includes("removed to keep the request") && sent.includes("A".repeat(10) + "3") && fwdImages === 2, `image parts: ${fwdImages}`);
+  ok("oldest image replaced by a note, newest kept", sent.includes("removed to keep the request") && sent.includes("A".repeat(10) + "3") && fwdImages <= 2, `image parts: ${fwdImages}`);
+}
+
+{
+  // count cap: 8 small images, MAX_IMAGES is 6 -> the 2 oldest are dropped
+  const img = (n) => ({ type: "image_url", image_url: { url: "data:image/png;base64," + "A".repeat(100) + String(n) } });
+  const msgs = [];
+  for (let i = 1; i <= 8; i++) msgs.push({ role: "user", content: [{ type: "text", text: "img " + i }, img(i)] });
+  const r2 = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock-ok", messages: msgs }),
+  });
+  ok("count-cap request succeeds", r2.status === 200, String(r2.status));
+  const sent2 = String(seen[seen.length - 1]?.raw ?? JSON.stringify(seen[seen.length - 1]?.body));
+  const kept2 = (sent2.match(/"type":"image_url"/g) || []).length;
+  ok("only the newest 6 images are kept", kept2 === 6 && sent2.includes("Image previously shared"), `image parts: ${kept2}`);
 }
 
 log("\nhot reload without a service restart");

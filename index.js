@@ -1575,7 +1575,7 @@ async function handle(req, res) {
   if (sessionAct) sessionAct.active++;
   try {
     if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
-    if (isChat && body.length > IMAGE_SHRINK_TRIGGER) body = shrinkOldImages(body);
+    if (isChat) body = trimOldImages(body);
     if (isChat && model) {
       body = await visionHandoff(body, model, req.headers.authorization, false, keySlot);
       const after = readRequest(body);
@@ -1898,31 +1898,58 @@ async function deferWhileBusy(model) {
   if (waited > 500) log(`deferred compaction ${model} ${(waited / 1000).toFixed(1)}s until in-flight requests settled`);
 }
 
-// The gateway refuses bodies over 12 MB (413 request_too_large). OpenCode reads
-// that refusal as "too long" and compacts, even when the token count is far under
-// the window. Long sessions with screenshots hit the byte limit first, so when a
-// body is over the trigger the oldest images are replaced with a short note, until
-// it is under the target. The newest images are kept.
+// Two limits, so long screenshot sessions stay small in bytes AND in image count:
+// 1. The gateway refuses bodies over 12 MB (413 request_too_large). OpenCode reads
+//    that as "too long" and compacts even when the token count is far under the
+//    window. Over the byte trigger, the oldest images are replaced with a short
+//    note until the body is under the target.
+// 2. A cap on the number of images kept (like UMANS' limitImagesInMessages):
+//    22 screenshots of one session is 22 vision reads even when each is small.
+//    The newest MAX_IMAGES are kept; the rest become "(Image previously shared)".
 const IMAGE_SHRINK_TRIGGER = Math.round((Number(process.env.FASFAS_PROXY_IMAGE_SHRINK_MB) || 8) * 1024 * 1024);
 const IMAGE_SHRINK_TARGET = Math.round(IMAGE_SHRINK_TRIGGER * 0.9);
-const IMAGE_NOTE = "[image removed to keep the request under the 12 MB gateway limit]";
+const IMAGE_SHRINK_NOTE = "[image removed to keep the request under the 12 MB gateway limit]";
+const IMAGE_COUNT_NOTE = "(Image previously shared)";
+const MAX_IMAGES = Math.max(0, Number(process.env.FASFAS_PROXY_MAX_IMAGES) || 6);
 
-function shrinkOldImages(body) {
+function trimOldImages(body) {
   let json;
   try { json = JSON.parse(body.toString("utf8")); } catch { return body; }
-  let size = body.length;
+  const imgs = collectImageParts(json); // oldest first
   let dropped = 0;
-  for (const im of collectImageParts(json)) { // oldest first
-    if (size <= IMAGE_SHRINK_TARGET) break;
+  let size = body.length;
+
+  // 1. Byte-size cap: drop the oldest until under the byte target.
+  if (size > IMAGE_SHRINK_TRIGGER) {
+    for (const im of imgs) {
+      if (size <= IMAGE_SHRINK_TARGET) break;
+      const content = json.messages[im.mi].content;
+      const before = Buffer.byteLength(JSON.stringify(content[im.pi]), "utf8");
+      content[im.pi] = { type: "text", text: IMAGE_SHRINK_NOTE };
+      size -= before - Buffer.byteLength(JSON.stringify(content[im.pi]), "utf8");
+      dropped++;
+    }
+  }
+
+  // 2. Count cap: keep only the newest MAX_IMAGES image parts. Older ones
+  //    that survived the byte cap (because they are small) become a note.
+  const survivors = [];
+  for (const im of imgs) {
+    const content = json.messages[im.mi]?.content;
+    if (content && isImagePart(content[im.pi])) survivors.push(im);
+  }
+  const toDrop = survivors.length - MAX_IMAGES;
+  for (let i = 0; i < toDrop; i++) {
+    const im = survivors[i];
     const content = json.messages[im.mi].content;
-    const before = Buffer.byteLength(JSON.stringify(content[im.pi]), "utf8");
-    content[im.pi] = { type: "text", text: IMAGE_NOTE };
-    size -= before - Buffer.byteLength(JSON.stringify(content[im.pi]), "utf8");
+    content[im.pi] = { type: "text", text: IMAGE_COUNT_NOTE };
     dropped++;
   }
+
   if (!dropped) return body;
   const out = Buffer.from(JSON.stringify(json), "utf8");
-  log(`dropped ${dropped} old image(s) to fit the gateway body limit: ${body.length} -> ${out.length} bytes`);
+  const keptCount = Math.max(0, survivors.length - Math.max(0, toDrop));
+  log(`dropped ${dropped} old image(s) (byte cap and/or ${MAX_IMAGES}-image cap): ${body.length} -> ${out.length} bytes, images kept: ${keptCount}`);
   return out;
 }
 

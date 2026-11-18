@@ -319,7 +319,8 @@ The provider's `apiKey` in OpenCode only has to be non-empty once keys are in th
 | `FASFAS_PROXY_COMPACTION` | on | `0` disables compaction protection |
 | `FASFAS_PROXY_COMPACTION_MODEL` | `glm-5.3-flash` | fallback for blocked summaries |
 | `FASFAS_PROXY_COMPACTION_MIN_BYTES` | `20000` | prompt size that marks a tool-less request as compaction |
-| `FASFAS_PROXY_IMAGE_SHRINK_MB` | `10` | body size (MB) where the oldest images are replaced by a note, until the body is 90% of this size |
+| `FASFAS_PROXY_IMAGE_SHRINK_MB` | `8` | body size (MB) where the oldest images are replaced by a note, until the body is 90% of this size |
+| `FASFAS_PROXY_MAX_IMAGES` | `6` | max image parts kept in a request; older ones become `(Image previously shared)` |
 
 Window units are `ms`, `s`, `m`, `h`. A plugin code change needs a service
 restart: a config reload deliberately reuses the running instance instead of
