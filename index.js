@@ -1576,6 +1576,16 @@ async function handle(req, res) {
   try {
     if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
     if (isChat) body = trimOldImages(body);
+    // Normal chat requests too: a body bigger than the model's context is refused
+    // upstream ("Provider returned error", 502). Keep the first message and the
+    // newest turns, as compaction does.
+    if (isChat && model && CONTEXT_WINDOWS[model] && estimateTokens(body) > CONTEXT_WINDOWS[model] * 0.9) {
+      const trimmed = trimConversationForCompaction(body, Math.floor(CONTEXT_WINDOWS[model] * 0.8));
+      if (trimmed) {
+        log(`chat body trimmed for ${model}: ${body.length} -> ${trimmed.length} bytes (over the context window)`);
+        body = trimmed;
+      }
+    }
     if (isChat && model) {
       body = await visionHandoff(body, model, req.headers.authorization, false, keySlot);
       const after = readRequest(body);
