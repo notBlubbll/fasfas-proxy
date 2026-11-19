@@ -32,11 +32,11 @@ on a different model instead of killing the turn.
 
 | Model | Context | Output | Image | Tools | Req/min | Tok/min |
 | --- | --- | --- | --- | --- | --- | --- |
-| `deepseek-v4.1-flash` | 1,048,576 | 65,536 | ? native | yes | 1,000 | 50,000,000 |
+| `deepseek-v4.1-flash` | 1,048,576 | 65,536 | ? native | yes | 50 | 5,000,000 |
 | `kimi-k3.1-pro` | 1,000,000 | 65,536 | ? native | yes | 20 | 2,000,000 |
 | `glm-5.3-flash` | 1,048,576 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
-| `glm-5.2` | 1,048,576 | 65,536 | ❌ text only | yes | 10 | 1,000,000 |
-| `haiku-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 20 | 2,000,000 |
+| `glm-5.2` | 1,048,576 | 65,536 | ❌ text only | yes | 20 | 1,000,000 |
+| `haiku-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 30 | 1,000,000 |
 
 Image generation (`POST /v1/images/generations`), passed through and counted in the
 usage table, with no request or token limits on the gateway:
@@ -56,8 +56,8 @@ usage table, with no request or token limits on the gateway:
   models from its own catalog). Call the endpoint directly.
 - All the chat models speak tools, streaming and `reasoning_effort`, and expose the variants
   `low` / `medium` / `high` / `xhigh` / `max`.
-- **The limits are per model, not shared.** The aggregate ceiling is 90 req/min
-  and 7M tok/min, reached only by running every model at once; saturating one
+- **The limits are per model, not shared.** The aggregate ceiling is 140 req/min
+  and 11M tok/min, reached only by running every model at once; saturating one
   model leaves the others untouched.
 - **Images are passed through untouched.** The other chat models see images natively
   (verified: haiku and sonnet name all four quadrants of a 64×64 image), so the
@@ -66,7 +66,7 @@ usage table, with no request or token limits on the gateway:
   support image input` from the gateway. For code it passed a check: it wrote a
   `parseDuration` function that passed 11 of 11 test cases in about 2s, and it
   returned a correct tool call.
-- `deepseek-v4.1-flash` is the largest budget (40 requests/minute per key). Use it for
+- `deepseek-v4.1-flash` is the largest budget (50 requests/minute per key). Use it for
   fan-out work instead of the smaller caps.
 
 > **Costs** in `/usage` and the panel are estimates using OpenCode's published
