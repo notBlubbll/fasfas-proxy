@@ -1,38 +1,6 @@
 {
     "$schema": "https://opencode.ai/config.json",
     "providers": {
-        "fasfas-images": {
-            "name": "Fasfas Images",
-            "package": "@opencode-ai/ai/providers/openai",
-            "settings": {
-                "baseURL": "http://127.0.0.1:17331/v1",
-                "apiKey": "{env:FASFAS_API_KEY}"
-            },
-            "models": {
-                "mai-image-2.6-flash": {
-                    "name": "MAI Image 2.6 Flash",
-                    "capabilities": {
-                        "input": [
-                            "text"
-                        ],
-                        "output": [
-                            "image"
-                        ]
-                    }
-                },
-                "mai-image-2.6": {
-                    "name": "MAI Image 2.6",
-                    "capabilities": {
-                        "input": [
-                            "text"
-                        ],
-                        "output": [
-                            "image"
-                        ]
-                    }
-                }
-            }
-        },
         "fasfas": {
             "name": "Fasfas",
             "package": "@opencode-ai/ai/providers/openai-compatible",
