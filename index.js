@@ -69,13 +69,13 @@ const UPSTREAM = (() => {
 // number of configured keys, so a second key doubles what the panel shows.
 const LIMITS_DEFAULT =
   "glm-5.3-flash=20/60s,glm-5.2=10/60s," +
-  "haiku-5.5=20/60s,deepseek-v4.1-flash=40/60s";
+  "haiku-5.5=20/60s,deepseek-v4.1-flash=1000/60s,kimi-k3.1-pro=20/60s";
 
 // Token-per-minute budget per model, straight from the gateway dashboard.
 // Env format (FASFAS_PROXY_TOKEN_LIMITS): "haiku-5.5=2000000/60s".
 // Unlisted models have no token budget.
 const TOKEN_LIMITS_DEFAULT =
-  "deepseek-v4.1-flash=5000000/60s,glm-5.3-flash=2000000/60s," +
+  "deepseek-v4.1-flash=50000000/60s,glm-5.3-flash=2000000/60s,kimi-k3.1-pro=2000000/60s," +
   "glm-5.2=1000000/60s,haiku-5.5=2000000/60s";
 
 // USD per 1M tokens, from the OpenCode Go table (off-peak where a model has
@@ -83,6 +83,7 @@ const TOKEN_LIMITS_DEFAULT =
 // Override with FASFAS_PROXY_PRICING="model=in/out/cached,...".
 const PRICING_DEFAULT = {
   "deepseek-v4.1-flash": { in: 0.15, out: 0.60, cached: 0.003 },
+  "kimi-k3.1-pro": { in: 0.0, out: 0.0, cached: 0.0 }, // gateway lists it at $0 (no catalog rate yet)
   "glm-5.3-flash": { in: 0.15, out: 0.50, cached: 0.03 },
   "haiku-5.5": { in: 0.10, out: 0.50, cached: 0.01 },
   // OpenCode Go table. The gateway lists it at $0, like its other models.
