@@ -183,36 +183,6 @@
                         "output": 65536
                     }
                 },
-                "mai-image-2.6-flash": {
-                    "name": "MAI Image 2.6 Flash",
-                    "capabilities": {
-                        "input": [
-                            "text"
-                        ],
-                        "output": [
-                            "image"
-                        ]
-                    },
-                    "limit": {
-                        "context": 4096,
-                        "output": 4096
-                    }
-                },
-                "mai-image-2.6": {
-                    "name": "MAI Image 2.6",
-                    "capabilities": {
-                        "input": [
-                            "text"
-                        ],
-                        "output": [
-                            "image"
-                        ]
-                    },
-                    "limit": {
-                        "context": 4096,
-                        "output": 4096
-                    }
-                },
                 "haiku-5.5": {
                     "name": "Claude Haiku 5.5",
                     "cost": [
@@ -281,6 +251,93 @@
                     ],
                     "limit": {
                         "context": 1000000,
+                        "output": 65536
+                    }
+                },
+                "mai-image-2.7-flash": {
+                    "name": "MAI Image 2.7 Flash",
+                    "capabilities": {
+                        "input": [
+                            "text"
+                        ],
+                        "output": [
+                            "image"
+                        ]
+                    },
+                    "limit": {
+                        "context": 4096,
+                        "output": 4096
+                    }
+                },
+                "mai-image-2.7": {
+                    "name": "MAI Image 2.7",
+                    "capabilities": {
+                        "input": [
+                            "text"
+                        ],
+                        "output": [
+                            "image"
+                        ]
+                    },
+                    "limit": {
+                        "context": 4096,
+                        "output": 4096
+                    }
+                },
+                "kimi-k3.1-pro": {
+                    "name": "Kimi K3.1 Pro",
+                    "cost": {
+                        "input": 0,
+                        "output": 0,
+                        "cache_read": 0
+                    },
+                    "capabilities": {
+                        "tools": true,
+                        "input": [
+                            "text",
+                            "image"
+                        ],
+                        "output": [
+                            "text"
+                        ]
+                    },
+                    "compatibility": {
+                        "reasoningField": "reasoning"
+                    },
+                    "variants": [
+                        {
+                            "id": "low",
+                            "settings": {
+                                "reasoningEffort": "low"
+                            }
+                        },
+                        {
+                            "id": "medium",
+                            "settings": {
+                                "reasoningEffort": "medium"
+                            }
+                        },
+                        {
+                            "id": "high",
+                            "settings": {
+                                "reasoningEffort": "high"
+                            }
+                        },
+                        {
+                            "id": "xhigh",
+                            "settings": {
+                                "reasoningEffort": "xhigh"
+                            }
+                        },
+                        {
+                            "id": "max",
+                            "settings": {
+                                "reasoningEffort": "max"
+                            }
+                        }
+                    ],
+                    "limit": {
+                        "context": 1048576,
                         "output": 65536
                     }
                 }
