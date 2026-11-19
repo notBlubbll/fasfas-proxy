@@ -84,7 +84,8 @@ config entry).
 | Model | Context | Output | Image | Req/min | Tok/min | Status | Retired | Why |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `qwen3.8-27b` | 1,000,000 | 65,536 | ✅ native | 20 | 3,000,000 | removed | 2026-11-16 | gone from `/v1/models`; calls return `404` |
-| `sonnet-5.5` | 1,000,000 | 65,536 | ✅ native | yes | 6 | 1,000,000 | removed | 2026-11-17 | gone from `/v1/models`; calls return `404` |
+| `sonnet-5.5` | 1,000,000 | 65,536 | ? native | yes | 6 | 1,000,000 | removed | 2026-11-17 | gone from `/v1/models`; calls return `404` |
+| `opus-5.5` (Claude Opus 5.5) | not recorded | not recorded | ? native | yes | 100 | 5,000,000 | archived | 2026-11-19 | not on the gateway list; limits from the dashboard (100 RPM, 5M TPM per key) |
 | gemini-4hy (Gemini 4 Hydrogen) | 1,000,000 | 65,536 | not tested | 20 | 3,000,000 | removed | 2026-11-16 | listed briefly; upstream rejected every call (ZDR policy), then it left `/v1/models` |
 
 - In the live OpenCode config a retired model can be kept as `disabled: true`

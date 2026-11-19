@@ -96,6 +96,9 @@ const PRICING_DEFAULT = {
 // Models the gateway no longer lists. Kept only so requests already in the usage
 // log still get a cost; they are not offered, listed or limited. To bring one
 // back, move it into PRICING_DEFAULT and restore its limits above.
+// Archived: not on the gateway list. To restore, add to LIMITS_DEFAULT
+// (opus-5.5=100/60s) and TOKEN_LIMITS_DEFAULT (opus-5.5=5000000/60s), and move
+// its price into PRICING_DEFAULT. Dashboard: 100 requests/min, 5M tokens/min per key.
 const RETIRED_PRICING = {
   "qwen3.8-27b": { in: 0.15, out: 0.47, cached: 0.016 }, // gone from the gateway (404)
   "sonnet-5.5": { in: 2.00, out: 10.00, cached: 0.10 }, // gone from the gateway (404)
