@@ -827,7 +827,13 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     const rows = Object.entries(models).sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0) || (b[1].output || 0) - (a[1].output || 0));
     for (const [name, m] of rows) {
       const tr = document.createElement("tr");
-      tr.appendChild(slotCell(td(displayModel(name), "left", { model: true, title: name }), name));
+      // Model cell tooltip: the API id plus the rates used for the cost column.
+      const p = (data.pricing || {})[name];
+      const priceTitle = p
+        ? [name, `input $${p.in}/Mtok · output $${p.out}/Mtok · cached $${p.cached}/Mtok`,
+           m.ttftMs || m.tpsN ? "" : null].filter(Boolean).join("\n")
+        : name;
+      tr.appendChild(slotCell(td(displayModel(name), "left", { model: true, title: priceTitle }), name));
       tr.appendChild(td(String(m.requests), "right"));
       tr.appendChild(td(fmt(m.input), "right"));
       tr.appendChild(td(fmt(m.output), "right"));
