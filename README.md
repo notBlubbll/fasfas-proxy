@@ -308,7 +308,7 @@ The provider's `apiKey` in OpenCode only has to be non-empty once keys are in th
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `FASFAS_PROXY_PORT` | `17331` | listen port (`127.0.0.1` only) |
-| `FASFAS_PROXY_UPSTREAM` | `https://ai.coffeevps.com/v1` | upstream base URL |
+| `FASFAS_PROXY_UPSTREAM` | `https://api.fasfas.ai/v1` | upstream base URL |
 | `FASFAS_PROXY_LIMITS` | table above | requests: `model=max/window`, `*=fallback`, `0` = unlimited |
 | `FASFAS_PROXY_TOKEN_LIMITS` | table above | tokens: `model=tokens/window` |
 | `FASFAS_PROXY_PRICING` | table above | `model=in/out/cached`, USD per 1M tokens |

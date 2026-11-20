@@ -1,5 +1,5 @@
 // fasfas-proxy/index.js — OpenCode V2 plugin: local OpenAI-compatible proxy
-// for an ai.coffeevps.com-style gateway.
+// for an api.fasfas.ai-style gateway.
 //
 // It does two things:
 //   1. RATE LIMITING — the gateway enforces a hard per-model cap and answers
@@ -44,7 +44,7 @@ const activeResponses = new Set();
 
 
 const TAG = "[fasfas-proxy]";
-const UPSTREAM_DEFAULT = "https://ai.coffeevps.com/v1";
+const UPSTREAM_DEFAULT = "https://api.fasfas.ai/v1";
 const LISTEN_HOST = "127.0.0.1";
 const PORT_DEFAULT = 17331;
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
