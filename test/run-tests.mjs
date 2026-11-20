@@ -423,6 +423,8 @@ log("\n/usage windows and per-model tokens");
   const r = await fetch(`${base}/usage`);
   const j = await r.json();
   ok("24h window has requests", j.windows?.["24h"]?.requests >= 1, JSON.stringify(j.windows?.["24h"]));
+  ok("24u window has today's requests", j.windows?.["24u"]?.requests >= 1 && j.windows["24u"].requests <= j.windows["24h"].requests, JSON.stringify(j.windows?.["24u"]));
+  ok("24u has per-model and per-key rows", !!j.models?.["24u"]?.["mock-ok"] && !!j.perKey?.["24u"], "");
   ok("7d/30d/all windows exist", !!j.windows?.["7d"] && !!j.windows?.["30d"] && !!j.windows?.all);
   ok("per-model row recorded", !!j.models?.["24h"]?.["mock-ok"], JSON.stringify(Object.keys(j.models?.["24h"] || {})));
   const m = j.models?.["24h"]?.["mock-ok"] || {};

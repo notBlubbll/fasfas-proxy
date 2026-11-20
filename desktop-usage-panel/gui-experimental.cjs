@@ -46,7 +46,7 @@ function elapsedSeconds(session) {
   return elapsed >= 0 && elapsed < 24 * 60 * 60 ? elapsed : 0;
 }
 
-const WINDOWS = ["24h", "7d", "30d", "all"];
+const WINDOWS = ["24u", "24h", "7d", "30d", "all"];
 
 // Readable names for model ids. Unknown ids fall back to the id itself.
 const MODEL_NAMES = {
@@ -181,12 +181,14 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   heading.style.cssText = "font-weight:650;font-size:13px;margin-right:auto;letter-spacing:.01em";
   head.appendChild(heading);
 
-  let win = "24h";
+  let win = "24u";
   const buttons = {};
   for (const w of WINDOWS) {
     const b = document.createElement("button");
     b.type = "button";
     b.textContent = w;
+    if (w === "24u") b.title = "Since 00:00 UTC today";
+    if (w === "24h") b.title = "Last 24 hours";
     b.style.cssText = [
       "padding:3px 9px",
       "border-radius:999px",

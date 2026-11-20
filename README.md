@@ -343,7 +343,7 @@ closing it, so a reload cannot kill streams that are mid-turn.
   to a local client only, and refuses browser origins.
 - `GET /status` → limits, vision config, compaction config, per-model counters
   (`total`, `throttled`, `retries`, `tokensUsed`), CORS enabled, `no-store`
-- `GET /usage` → per-model totals for `24h`, `7d`, `30d`, `all`:
+- `GET /usage` → per-model totals for `24u` (since 00:00 UTC), `24h`, `7d`, `30d`, `all`:
 
 ```json
 {
@@ -402,7 +402,7 @@ observations can describe; re-running replaces the previous seeds.
 - summary cards for requests, input, output and cost;
 - one row per model — requests, in, out, reasoning, cached, tok/s, latency, cost;
 - a totals row with the same padding as the model rows;
-- a `24h | 7d | 30d | all` switch, a **↻** refresh button and 5s auto-refresh;
+- a `24u | 24h | 7d | 30d | all` switch (default `24u`, since 00:00 UTC), a **↻** refresh button and 5s auto-refresh;
 - a composer pill while the routed session is working:
   `Working (12s · retrying 2 · HTTP 502)`, the retry part appearing only when the
   proxy is re-sending a request. This replaces a standalone working-timer plugin —
