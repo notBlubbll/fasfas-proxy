@@ -565,7 +565,7 @@ log("\nkey pool");
 {
   // Pins persist in the keys file beside the proxy, so clear the session ids this
   // block uses; otherwise an earlier run decides where they land.
-  for (const sid of ["ses_alpha", "ses_beta", "ses_pinned", "ses_after"]) {
+  for (const sid of ["ses_alpha", "ses_beta", "ses_pinned", "ses_after", "ses_ping_busy"]) {
     await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ unpin: sid }) });
   }
   let r = await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ keys: ["sk-test-aaaa1111", "sk-test-bbbb2222"] }) });
@@ -592,6 +592,24 @@ log("\nkey pool");
   await chat({ "x-opencode-session-id": "ses_beta" }).then((x) => x.text());
   const spread = seen.slice(before).map((c) => c.auth);
   ok("two sessions land on different keys", new Set(spread).size === 2 && spread.every((a) => a.startsWith("Bearer sk-test-")), JSON.stringify(spread));
+
+  // A ping must not use a key that is busy: with one request in flight on key 1,
+  // it picks key 2 and sends a real Bearer credential for that key.
+  const pingBusy = "ses_ping_busy";
+  await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ pin: { session: pingBusy, key: 1 } }) });
+  const slowPing = fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: "Bearer inbound-key", "content-type": "application/json", "x-opencode-session-id": pingBusy },
+    body: JSON.stringify({ model: "mock-slow", messages: [{ role: "user", content: "hold key 1 busy" }] }),
+  }).then((x) => x.text());
+  await sleep(200);
+  const pingMark = seen.length;
+  const pingRes = await fetch(`${base}/ping`, { method: "POST", body: JSON.stringify({ models: ["mock-ok"] }) }).then((x) => x.json());
+  const pingHit = seen.slice(pingMark).find((x) => x.body.model === "mock-ok");
+  ok("ping uses the key with the least current load", pingHit?.auth === "Bearer sk-test-bbbb2222", String(pingHit?.auth));
+  ok("ping succeeds with a pooled key", pingRes.results?.[0]?.ok === true, JSON.stringify(pingRes.results?.[0]));
+  await slowPing;
+  await fetch(`${base}/keys`, { method: "POST", body: JSON.stringify({ unpin: pingBusy }) });
 
   before = seen.length;
   for (let i = 0; i < 2; i++) await chat({ "x-opencode-session-id": "ses_pinned" }).then((x) => x.text());

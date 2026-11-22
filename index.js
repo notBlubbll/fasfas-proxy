@@ -990,16 +990,29 @@ async function pingModel(model, auth, pingSlot = 0) {
 }
 
 // One limiter per model, so the models are pinged concurrently and a busy model
-// only delays its own row. All pings share the same key: the one with the fewest
-// live sessions, so a ping does not compete with real traffic on a busy key.
-async function pingModels(models, auth) {
-  const counts = liveSessionCounts();
+// only delays its own row. All pings share the key with the least current
+// concurrent usage: fewest requests in flight on its sessions, then fewest live
+// sessions. A ping therefore never competes with an active turn on a busy key.
+async function pingModels(models, fallbackAuth) {
+  const now = Date.now();
+  const load = Array.from({ length: keyPool.length }, () => ({ active: 0, live: 0 }));
+  for (const [sid, slot] of sessionKeyPins) {
+    if (slot < 1 || slot > keyPool.length) continue;
+    const a = sessionActivity.get(sid);
+    if (!a || now - a.last > SESSION_LIVE_MS) continue;
+    load[slot - 1].live++;
+    load[slot - 1].active += a.active || 0;
+  }
   let slot = 0;
   if (keyPool.length) {
     slot = 1;
-    for (let i = 1; i < counts.length; i++) if (counts[i] < counts[slot - 1]) slot = i + 1;
+    for (let i = 1; i < load.length; i++) {
+      if (load[i].active < load[slot - 1].active ||
+          (load[i].active === load[slot - 1].active && load[i].live < load[slot - 1].live)) slot = i + 1;
+    }
   }
-  log(`ping using key ${slot} (${counts.join("/") || "no keys"} live sessions)`);
+  const auth = slot ? `Bearer ${keyPool[slot - 1]}` : fallbackAuth;
+  log(`ping using key ${slot || "-"} (${load.map((l) => `${l.active} active/${l.live} live`).join(", ") || "no keys"})`);
   return Promise.all(models.map((m) => pingModel(m, auth, slot)));
 }
 
@@ -1484,7 +1497,7 @@ async function handle(req, res) {
         ...[...TOKEN_LIMITS].filter(([k]) => k !== "*").map(([k]) => k),
       ])].sort();
 
-    const auth = pickKey(null) || req.headers.authorization || lastAuthHeader;
+    const auth = req.headers.authorization || lastAuthHeader;
     log(`ping ${models.length} model(s) via POST /ping: ${models.join(" ")}`);
     const results = await pingModels(models, auth);
     log(`ping done: ${results.map((r) => `${r.model}=${r.ok ? "ok" : r.skipped ? "skipped" : "fail"}`).join(" ")}`);
