@@ -413,6 +413,19 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   ].join(";");
   pingRow.appendChild(pingBtn);
 
+  // One-click copy of the whole result as tab-separated rows, so it pastes into
+  // a sheet or chat. The table itself is selectable too.
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.textContent = "Copy";
+  copyBtn.disabled = true;
+  copyBtn.style.cssText = [
+    "padding:4px 10px", "border-radius:8px", "border:1px solid rgba(127,127,127,.35)",
+    "background:transparent", "color:inherit", "cursor:pointer", "font:inherit",
+    "font-weight:600", "opacity:.45",
+  ].join(";");
+  pingRow.appendChild(copyBtn);
+
   const pingNote = document.createElement("span");
   pingNote.textContent = '"state your model and say pong"';
   pingNote.style.cssText = "opacity:.5;font-size:11px";
@@ -420,9 +433,32 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   pingBox.appendChild(pingRow);
 
   const pingOut = document.createElement("div");
-  pingOut.style.cssText = "display:flex;flex-direction:column;gap:2px;font-variant-numeric:tabular-nums";
+  pingOut.style.cssText = "overflow:auto;font-variant-numeric:tabular-nums";
   pingBox.appendChild(pingOut);
   root.appendChild(pingBox);
+
+  let pingText = "";
+  const setCopyState = (enabled) => {
+    copyBtn.disabled = !enabled;
+    copyBtn.style.opacity = enabled ? "1" : ".45";
+    copyBtn.textContent = "Copy";
+  };
+  copyBtn.onclick = async () => {
+    if (!pingText) return;
+    try {
+      await navigator.clipboard.writeText(pingText);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = pingText;
+      ta.style.cssText = "position:fixed;left:-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch {}
+      ta.remove();
+    }
+    copyBtn.textContent = "Copied";
+    setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+  };
 
   let pingBusy = false;
   async function ping() {
@@ -432,6 +468,8 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     pingBtn.style.opacity = ".55";
     pingBtn.textContent = "Pinging…";
     pingOut.textContent = "";
+    pingText = "";
+    setCopyState(false);
     const waiting = document.createElement("div");
     waiting.textContent = "asking every model…";
     waiting.style.cssText = "opacity:.6";
@@ -440,28 +478,58 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       const r = await fetch(endpoint.replace(/\/usage\/?$/, "/ping"), { method: "POST", cache: "no-store" });
       const j = await r.json();
       pingOut.textContent = "";
-      for (const p of j.results || []) {
-        const line = document.createElement("div");
-        line.style.cssText = "display:flex;gap:8px;align-items:baseline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
-        const name = document.createElement("span");
-        name.textContent = p.model;
-        name.style.cssText = "flex:0 0 auto;opacity:.65;min-width:130px";
-        const body = document.createElement("span");
-        if (p.ok) {
-          body.textContent = `${(p.text || "").replace(/\s+/g, " ").slice(0, 90)} · ${secs(p.ms)}`;
-        } else {
-          body.textContent = p.skipped ? `skipped — ${p.error}` : `failed — ${p.error}`;
-          body.style.opacity = ".6";
-        }
-        body.style.cssText += ";overflow:hidden;text-overflow:ellipsis";
-        line.appendChild(name);
-        line.appendChild(body);
-        pingOut.appendChild(line);
+      const results = j.results || [];
+      if (!results.length) {
+        const none = document.createElement("div");
+        none.textContent = "no models answered";
+        none.style.cssText = "opacity:.6";
+        pingOut.appendChild(none);
+      } else {
+        const tbl = document.createElement("table");
+        tbl.style.cssText = "width:100%;border-collapse:collapse;font-size:12px;user-select:text;-webkit-user-select:text;cursor:text";
+        const head = document.createElement("tr");
+        head.appendChild(th("Model", "left"));
+        head.appendChild(th("Status", "left"));
+        head.appendChild(th("Reply", "left"));
+        head.appendChild(th("Time", "right"));
+        tbl.appendChild(head);
+        results.forEach((p, i) => {
+          const last = i === results.length - 1;
+          const tr = document.createElement("tr");
+          tr.appendChild(td(displayModel(p.model), "left", { last, title: p.model, model: true }));
+          const status = p.ok ? "ok" : p.skipped ? "skipped" : "failed";
+          const st = td(status, "left", { last, muted: !p.ok, strong: p.ok });
+          if (!p.ok) st.style.color = "rgb(190,110,90)";
+          tr.appendChild(st);
+          const reply = td(p.ok ? (p.text || "") : (p.error || ""), "left", {
+            last, muted: !p.ok,
+            title: p.ok ? "" : `${p.model}: ${p.error || ""}`,
+          });
+          reply.style.whiteSpace = "pre-wrap";
+          reply.style.wordBreak = "break-word";
+          reply.style.maxWidth = "340px";
+          tr.appendChild(reply);
+          tr.appendChild(td(p.ms ? secs(p.ms) : "-", "right", { last, muted: !p.ms }));
+          tbl.appendChild(tr);
+        });
+        pingOut.appendChild(tbl);
+        pingText = [
+          ["Model", "Status", "Reply", "Time"].join("\t"),
+          ...results.map((p) => [
+            displayModel(p.model),
+            p.ok ? "ok" : p.skipped ? "skipped" : "failed",
+            (p.ok ? p.text : p.error) || "",
+            p.ms ? secs(p.ms) : "",
+          ].map((v) => String(v).replace(/\t/g, " ").replace(/\r?\n/g, " ")).join("\t")),
+        ].join("\n");
+        setCopyState(true);
       }
       // pings are real requests, so refresh the numbers too
       refresh();
     } catch (e) {
       pingOut.textContent = "";
+      pingText = "";
+      setCopyState(false);
       const err = document.createElement("div");
       err.textContent = "ping failed: " + ((e && e.message) || "unreachable");
       err.style.cssText = "opacity:.6";
