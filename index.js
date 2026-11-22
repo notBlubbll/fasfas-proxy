@@ -944,7 +944,10 @@ function keysReport() {
 // jumping the queue, and it is only skipped if the wait would outlast any window
 // (three minutes).
 const PING_PROMPT = "State the model you are and reply in exactly this form: I run <model name>, pong";
-const PING_MAX_WAIT_MS = Number(process.env.FASFAS_PROXY_PING_WAIT_MS) || 180000;
+const PING_TIMEOUT_MS = Number(process.env.FASFAS_PROXY_PING_TIMEOUT_MS) || 30000;
+// The slot wait shares the same deadline: a ping returns within PING_TIMEOUT_MS
+// whether it was waiting for a limiter slot or for the upstream reply.
+const PING_MAX_WAIT_MS = Math.min(Number(process.env.FASFAS_PROXY_PING_WAIT_MS) || 180000, PING_TIMEOUT_MS);
 let lastAuthHeader = null; // most recent gateway credential seen on a real request
 
 async function pingModel(model, auth, pingSlot = 0) {
@@ -971,7 +974,7 @@ async function pingModel(model, auth, pingSlot = 0) {
 
   try {
     const payload = { model, stream: false, max_tokens: 60, messages: [{ role: "user", content: PING_PROMPT }] };
-    const res = await postJson("/chat/completions", { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) }, payload, 60000);
+    const res = await postJson("/chat/completions", { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) }, payload, Math.max(1000, PING_TIMEOUT_MS - queueMs));
     const ms = Date.now() - started;
     if (res.status >= 400) {
       return { model, ok: false, queueMs, ms, error: `HTTP ${res.status}: ${res.text.replace(/\s+/g, " ").slice(0, 140)}` };
@@ -1269,7 +1272,7 @@ function postJson(urlPath, headers, payload, timeoutMs = 180000) {
       method: "POST",
       headers: { ...headers, "content-length": String(body.length) },
     });
-    const timer = setTimeout(() => { try { req.destroy(); } catch {} reject(new Error("vision request timed out")); }, timeoutMs);
+    const timer = setTimeout(() => { try { req.destroy(); } catch {} reject(new Error(`request timed out after ${Math.round(timeoutMs / 1000)}s`)); }, timeoutMs);
     req.on("response", (res) => {
       const chunks = [];
       let size = 0;

@@ -323,6 +323,8 @@ The provider's `apiKey` in OpenCode only has to be non-empty once keys are in th
 | `FASFAS_PROXY_COMPACTION_MIN_BYTES` | `20000` | prompt size that marks a tool-less request as compaction |
 | `FASFAS_PROXY_IMAGE_SHRINK_MB` | `8` | body size (MB) where the oldest images are replaced by a note, until the body is 90% of this size |
 | `FASFAS_PROXY_MAX_IMAGES` | `6` | max image parts kept in a request; older ones become `(Image previously shared)` |
+| `FASFAS_PROXY_PING_TIMEOUT_MS` | `30000` | hard limit for one ping, including any wait for a limiter slot |
+| `FASFAS_PROXY_PING_WAIT_MS` | `180000` | slot wait for a ping; capped by the ping timeout above |
 
 Window units are `ms`, `s`, `m`, `h`. A plugin code change needs a service
 restart: a config reload deliberately reuses the running instance instead of
