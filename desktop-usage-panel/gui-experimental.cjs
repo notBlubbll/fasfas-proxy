@@ -415,9 +415,10 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
 
   // One-click copy of the whole result as tab-separated rows, so it pastes into
   // a sheet or chat. The table itself is selectable too.
+  const COPY_LABEL = "Copy for Discord";
   const copyBtn = document.createElement("button");
   copyBtn.type = "button";
-  copyBtn.textContent = "Copy";
+  copyBtn.textContent = COPY_LABEL;
   copyBtn.disabled = true;
   copyBtn.style.cssText = [
     "padding:4px 10px", "border-radius:8px", "border:1px solid rgba(127,127,127,.35)",
@@ -438,26 +439,45 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   root.appendChild(pingBox);
 
   let pingText = "";
+  // A monospace table inside a code block: Discord keeps the padding, so the
+  // columns line up when pasted as one message.
+  function discordPingTable(results) {
+    const rows = results.map((p) => [
+      displayModel(p.model),
+      p.ok ? "ok" : p.skipped ? "skipped" : "failed",
+      p.ms ? secs(p.ms) : "-",
+      String((p.ok ? p.text : p.error) || "").replace(/\s+/g, " ").trim(),
+    ]);
+    const head = ["Model", "Status", "Time", "Reply"];
+    const widths = [0, 1, 2].map((i) => Math.max(head[i].length, ...rows.map((r) => r[i].length)));
+    const line = (cells) => `${cells[0].padEnd(widths[0])}  ${cells[1].padEnd(widths[1])}  ${cells[2].padEnd(widths[2])}  ${cells[3]}`;
+    const body = [head, ...rows].map(line).join("\n").replace(/```/g, "'''");
+    return "```\n" + body + "\n```";
+  }
   const setCopyState = (enabled) => {
     copyBtn.disabled = !enabled;
     copyBtn.style.opacity = enabled ? "1" : ".45";
-    copyBtn.textContent = "Copy";
+    copyBtn.textContent = COPY_LABEL;
   };
   copyBtn.onclick = async () => {
     if (!pingText) return;
-    try {
-      await navigator.clipboard.writeText(pingText);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = pingText;
-      ta.style.cssText = "position:fixed;left:-9999px";
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand("copy"); } catch {}
-      ta.remove();
+    // execCommand through a focused textarea first: it does not depend on the
+    // clipboard permission the desktop shell may deny.
+    let ok = false;
+    const ta = document.createElement("textarea");
+    ta.value = pingText;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { ok = document.execCommand("copy"); } catch {}
+    ta.remove();
+    if (!ok && navigator.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(pingText); ok = true; } catch {}
     }
-    copyBtn.textContent = "Copied";
-    setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+    copyBtn.textContent = ok ? "Copied" : "Copy failed";
+    setTimeout(() => { copyBtn.textContent = COPY_LABEL; }, 1400);
   };
 
   let pingBusy = false;
@@ -513,15 +533,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
           tbl.appendChild(tr);
         });
         pingOut.appendChild(tbl);
-        pingText = [
-          ["Model", "Status", "Reply", "Time"].join("\t"),
-          ...results.map((p) => [
-            displayModel(p.model),
-            p.ok ? "ok" : p.skipped ? "skipped" : "failed",
-            (p.ok ? p.text : p.error) || "",
-            p.ms ? secs(p.ms) : "",
-          ].map((v) => String(v).replace(/\t/g, " ").replace(/\r?\n/g, " ")).join("\t")),
-        ].join("\n");
+        pingText = discordPingTable(results);
         setCopyState(true);
       }
       // pings are real requests, so refresh the numbers too
